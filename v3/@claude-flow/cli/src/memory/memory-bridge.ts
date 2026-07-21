@@ -19,6 +19,7 @@
 
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { createRequire } from 'node:module';
 
 // ===== Lazy singleton =====
 
@@ -26,20 +27,65 @@ let registryPromise: Promise<any> | null = null;
 let registryInstance: any = null;
 let bridgeAvailable: boolean | null = null;
 
+// #2735 — the native-bridge -> sql.js whole-image fallback used to be
+// completely silent: a registry init failure cached `bridgeAvailable =
+// false` for the rest of the process, and a per-operation bridge exception
+// swallowed itself with a bare `catch { return null; }` — in both cases the
+// caller fell back to memory-initializer.ts's unsafe whole-image sql.js
+// path with zero diagnostic trail. When that path corrupted a database, the
+// demotion that caused it was structurally unknowable after the fact. Log
+// once per distinct reason (not once per call — a hot per-op catch could
+// otherwise spam stderr on every single memory operation) so the first
+// occurrence is attributable. Stderr only — never stdout, which callers may
+// be parsing as JSON.
+const loggedDemotions = new Set<string>();
+function logDemotionOnce(where: string, reason: string): void {
+  const dedupeKey = `${where}:${reason}`;
+  if (loggedDemotions.has(dedupeKey)) return;
+  loggedDemotions.add(dedupeKey);
+  try {
+    process.stderr.write(
+      `[memory-bridge] demoted to sql.js fallback in ${where}: ${reason}\n`,
+    );
+  } catch { /* stderr unavailable — nothing more we can do */ }
+}
+
 /**
  * Resolve database path with path traversal protection.
- * Only allows paths within or below the project's .swarm directory,
+ * Only allows paths within or below the project's working directory,
  * or the special ':memory:' path.
+ *
+ * #1945: the previous hard-coded `<cwd>/.swarm/memory.db` default ignored
+ * `CLAUDE_FLOW_MEMORY_PATH` / `claude-flow.config.json#memory.persistPath`
+ * — so users with non-default memory paths had `memory init` write to e.g.
+ * `data/memory/memory.db` while `bridgeStoreEntry()` wrote to
+ * `.swarm/memory.db`. CLI store reported success against the wrong file and
+ * a fresh process reading the configured path saw nothing.
+ *
+ * Use `getMemoryRoot()` (from memory-initializer) so the bridge and the
+ * initializer agree on the same file. Imported via require() to avoid a
+ * circular ESM dep between memory-initializer.ts and memory-bridge.ts.
  */
 function getDbPath(customPath?: string): string {
-  const swarmDir = path.resolve(process.cwd(), '.swarm');
-  if (!customPath) return path.join(swarmDir, 'memory.db');
+  let defaultDir = path.resolve(process.cwd(), '.swarm');
+  try {
+    // `getMemoryRoot()` honors $CLAUDE_FLOW_MEMORY_PATH, then the
+    // claude-flow.config.json `memory.persistPath`, then defaults to `.swarm`.
+    const cjsRequire = createRequire(import.meta.url);
+    const mod = cjsRequire('./memory-initializer.js') as { getMemoryRoot?: () => string };
+    if (typeof mod.getMemoryRoot === 'function') {
+      defaultDir = mod.getMemoryRoot();
+    }
+  } catch {
+    /* memory-initializer not resolvable in this build — keep `.swarm/` default */
+  }
+  if (!customPath) return path.join(defaultDir, 'memory.db');
   if (customPath === ':memory:') return ':memory:';
   const resolved = path.resolve(customPath);
-  // Ensure the path doesn't escape the working directory
+  // Ensure the path doesn't escape the working directory.
   const cwd = process.cwd();
   if (!resolved.startsWith(cwd)) {
-    return path.join(swarmDir, 'memory.db'); // fallback to safe default
+    return path.join(defaultDir, 'memory.db'); // fallback to safe default
   }
   return resolved;
 }
@@ -302,9 +348,13 @@ async function getRegistry(dbPath?: string): Promise<any | null> {
         registryInstance = registry;
         bridgeAvailable = true;
         return registry;
-      } catch {
+      } catch (err) {
         bridgeAvailable = false;
         registryPromise = null;
+        logDemotionOnce(
+          'getRegistry (process-wide, cached for the rest of this process)',
+          err instanceof Error ? err.message : String(err),
+        );
         return null;
       }
     })();
@@ -322,15 +372,14 @@ async function getRegistry(dbPath?: string): Promise<any | null> {
  */
 function bm25Score(
   queryTerms: string[],
-  docContent: string,
+  docWords: string[],
+  docLength: number,
   avgDocLength: number,
   docCount: number,
   termDocFreqs: Map<string, number>,
 ): number {
   const k1 = 1.2;
   const b = 0.75;
-  const docWords = docContent.toLowerCase().split(/\s+/);
-  const docLength = docWords.length;
 
   let score = 0;
   for (const term of queryTerms) {
@@ -347,28 +396,40 @@ function bm25Score(
 }
 
 /**
- * Compute BM25 term document frequencies for a set of rows.
+ * Tokenize a corpus once per query. Each row is lowercased + split a single
+ * time; the resulting `{ contentLower, words }` feed BM25 term-frequency,
+ * per-doc BM25 scoring, and the #2558 coverage floor — which previously each
+ * re-lowercased+re-split the same content (3× string scans per row).
+ * Bit-identical to the prior split-per-consumer path.
+ */
+interface TokenizedDoc { contentLower: string; words: string[] }
+function tokenizeCorpus(rows: Array<{ content: string }>): TokenizedDoc[] {
+  return rows.map(row => {
+    const contentLower = (row.content || '').toLowerCase();
+    return { contentLower, words: contentLower.split(/\s+/) };
+  });
+}
+
+/**
+ * Compute BM25 term document frequencies over an already-tokenized corpus.
  */
 function computeTermDocFreqs(
   queryTerms: string[],
-  rows: Array<{ content: string }>,
+  docs: TokenizedDoc[],
 ): { termDocFreqs: Map<string, number>; avgDocLength: number } {
   const termDocFreqs = new Map<string, number>();
   let totalLength = 0;
 
-  for (const row of rows) {
-    const content = (row.content || '').toLowerCase();
-    const words = content.split(/\s+/);
-    totalLength += words.length;
-
+  for (const doc of docs) {
+    totalLength += doc.words.length;
     for (const term of queryTerms) {
-      if (content.includes(term)) {
+      if (doc.contentLower.includes(term)) {
         termDocFreqs.set(term, (termDocFreqs.get(term) || 0) + 1);
       }
     }
   }
 
-  return { termDocFreqs, avgDocLength: rows.length > 0 ? totalLength / rows.length : 1 };
+  return { termDocFreqs, avgDocLength: docs.length > 0 ? totalLength / docs.length : 1 };
 }
 
 // ===== Phase 2: TieredCache helpers =====
@@ -465,6 +526,11 @@ async function logAttestation(
   }
 }
 
+// Tracks db handles whose schema DDL has already been ensured, so getDb()
+// runs the CREATE…IF NOT EXISTS block at most once per handle instead of on
+// every bridge call. WeakSet so handles GC without leaking.
+const _schemaEnsuredDbs = new WeakSet<object>();
+
 /**
  * Get the AgentDB database handle and ensure memory_entries table exists.
  * Returns null if not available.
@@ -475,37 +541,133 @@ function getDb(registry: any): any | null {
 
   const db = agentdb.database;
 
-  // Ensure memory_entries table exists (idempotent)
-  try {
-    db.exec(`CREATE TABLE IF NOT EXISTS memory_entries (
-      id TEXT PRIMARY KEY,
-      key TEXT NOT NULL,
-      namespace TEXT DEFAULT 'default',
-      content TEXT NOT NULL,
-      type TEXT DEFAULT 'semantic',
-      embedding TEXT,
-      embedding_model TEXT DEFAULT 'local',
-      embedding_dimensions INTEGER,
-      tags TEXT,
-      metadata TEXT,
-      owner_id TEXT,
-      created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
-      updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
-      expires_at INTEGER,
-      last_accessed_at INTEGER,
-      access_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'active',
-      UNIQUE(namespace, key)
-    )`);
-    // Ensure indexes
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_ns ON memory_entries(namespace)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_key ON memory_entries(key)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_status ON memory_entries(status)`);
-  } catch {
-    // Table already exists or db is read-only — that's fine
+  // Ensure memory_entries table exists (idempotent). The DDL is run at most
+  // once per db handle — re-parsing 4× CREATE…IF NOT EXISTS on every bridge
+  // call (store/search/get) was pure per-op overhead. Keyed by handle via a
+  // WeakSet so a new db instance re-ensures without a stale global flag.
+  if (!_schemaEnsuredDbs.has(db)) {
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS memory_entries (
+        id TEXT PRIMARY KEY,
+        key TEXT NOT NULL,
+        namespace TEXT DEFAULT 'default',
+        content TEXT NOT NULL,
+        type TEXT DEFAULT 'semantic',
+        embedding TEXT,
+        embedding_model TEXT DEFAULT 'local',
+        embedding_dimensions INTEGER,
+        tags TEXT,
+        metadata TEXT,
+        owner_id TEXT,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+        expires_at INTEGER,
+        last_accessed_at INTEGER,
+        access_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active',
+        UNIQUE(namespace, key)
+      )`);
+      // Ensure indexes
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_ns ON memory_entries(namespace)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_key ON memory_entries(key)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_status ON memory_entries(status)`);
+      _schemaEnsuredDbs.add(db);
+    } catch {
+      // Table already exists or db is read-only — that's fine. Don't mark
+      // ensured on failure so a later writable call can retry.
+    }
   }
 
+  // ─── #2256-followup: rescue agentdb.embedder when its transformers.js
+  // path fell through to mock embeddings.
+  //
+  // What was happening: agentdb's `EmbeddingService.initialize()` always
+  // tries `@xenova/transformers` first, which transitively requires `sharp`
+  // → `libvips`. On macOS arm64 systems without `brew install vips`, sharp
+  // fails to load and agentdb silently falls back to MOCK EMBEDDINGS
+  // (random vectors). The bridge then calls `agentdb.embedder.embed(...)`
+  // and gets garbage; semantic search returns no useful matches.
+  //
+  // In our process, `memory-initializer.ts::loadEmbeddingModel()` already
+  // tried this same chain and ALSO has a working ruvector-ONNX fallback
+  // that the user typically reaches before the bridge initialises. The
+  // ruvector ONNX model has been loaded; the agentdb instance just doesn't
+  // know about it. We monkey-patch `embed`/`embedBatch` to delegate to our
+  // `generateEmbedding()` so the bridge gets real vectors.
+  //
+  // Detection signal: `embedder.pipeline === null` after init means
+  // transformers failed and agentdb would otherwise use mockEmbedding().
+  // Patch is idempotent (`__ruvectorRescued` sentinel) and a no-op if
+  // ruvector is also unavailable.
+  rescueAgentdbEmbedder(agentdb).catch(() => { /* non-fatal */ });
+
   return { db, agentdb };
+}
+
+// One-shot guard so we only patch once per process — the embedder is shared
+// by ReflexionMemory/SkillLibrary/CausalRecall and they all see the same
+// object reference.
+let _embedderPatched = false;
+async function rescueAgentdbEmbedder(agentdb: { embedder?: { pipeline?: unknown; embed?: (t: string) => Promise<Float32Array>; embedBatch?: (ts: string[]) => Promise<Float32Array[]>; __ruvectorRescued?: boolean } }): Promise<void> {
+  if (_embedderPatched) return;
+  const emb = agentdb?.embedder;
+  if (!emb || emb.__ruvectorRescued) return;
+
+  // Only rescue when transformers.js initialisation failed: that's
+  // signalled by a null pipeline. If transformers IS working, agentdb's
+  // own embed() does the right thing and we should not interpose.
+  if (emb.pipeline) return;
+
+  // #2312: delegate to generateLOCALEmbedding, NOT generateEmbedding.
+  // generateEmbedding is bridge-first — routing the rescued embed through it
+  // closes a cycle (generateEmbedding → bridgeGenerateEmbedding →
+  // embedder.embed [patched] → generateEmbedding → …) that allocated
+  // unboundedly via microtasks until V8 hit the heap limit (~4 GB on the CI
+  // runner, SIGABRT 134). The local chain never consults the bridge, so the
+  // rescued embedder is a leaf. If the running memory-initializer build
+  // predates generateLocalEmbedding, decline the rescue entirely — a stale
+  // pairing must fail safe, not recurse.
+  type EmbedFn = (text: string) => Promise<{ embedding: number[] | Float32Array; dimensions: number; model: string; backend?: 'onnx' | 'mock' }>;
+  let localEmbed: EmbedFn | null = null;
+  try {
+    const mod = (await import('./memory-initializer.js')) as unknown as { generateLocalEmbedding?: EmbedFn };
+    localEmbed = mod.generateLocalEmbedding ?? null;
+  } catch {
+    return; // can't import the rescuer — leave the mock fallback alone
+  }
+  if (!localEmbed) return;
+  const embed: EmbedFn = localEmbed;
+
+  // Probe once to confirm the rescuer actually returns REAL ONNX vectors
+  // (#2312: the old probe only checked non-zero, which the deterministic
+  // hash fallback also satisfies — so it "rescued" agentdb's mock with our
+  // own mock and reported it as real). Require backend === 'onnx'.
+  try {
+    const probe = await embed('rescue-probe');
+    const arr = probe?.embedding ? Array.from(probe.embedding as ArrayLike<number>) : [];
+    const hasSignal = arr.length > 0 && arr.some((v: number) => Math.abs(v) > 1e-9);
+    if (!hasSignal || probe.backend !== 'onnx') {
+      // Local chain is also degraded — leave agentdb's embedder alone, but
+      // tag it so bridgeGenerateEmbedding's AUDIT-#3 isMock check reports
+      // backend='mock' truthfully instead of labeling mock vectors 'onnx'.
+      try { (emb as { backend?: string }).backend = 'mock'; } catch { /* frozen */ }
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  const newEmbed = async (text: string): Promise<Float32Array> => {
+    const out = await embed(text);
+    return out.embedding instanceof Float32Array
+      ? out.embedding
+      : new Float32Array((out.embedding as number[]) ?? []);
+  };
+  emb.embed = newEmbed;
+  emb.embedBatch = async (texts: string[]): Promise<Float32Array[]> =>
+    Promise.all(texts.map(t => newEmbed(t)));
+  emb.__ruvectorRescued = true;
+  _embedderPatched = true;
 }
 
 // ===== Bridge functions — match memory-initializer.ts signatures =====
@@ -545,6 +707,13 @@ export async function bridgeStoreEntry(options: {
     const id = generateId('entry');
     const now = Date.now();
 
+    // #2245 — record the activity so signalsProcessed stops being a dead
+    // zero. Fire-and-forget; never blocks the write path.
+    try {
+      const intel = await import('./intelligence.js');
+      intel.recordSignalProcessed();
+    } catch { /* intelligence module not yet initialised */ }
+
     // Phase 5: MutationGuard validation before write
     const guardResult = await guardValidate(registry, 'store', { key, namespace, size: value.length });
     if (!guardResult.allowed) {
@@ -553,6 +722,7 @@ export async function bridgeStoreEntry(options: {
 
     // Generate embedding via AgentDB's embedder
     let embeddingJson: string | null = null;
+    let embeddingArr: number[] | null = null;
     let dimensions = 0;
     let model = 'local';
 
@@ -562,7 +732,8 @@ export async function bridgeStoreEntry(options: {
         if (embedder) {
           const emb = await embedder.embed(value);
           if (emb) {
-            embeddingJson = JSON.stringify(Array.from(emb));
+            embeddingArr = Array.from(emb) as number[];
+            embeddingJson = JSON.stringify(embeddingArr);
             dimensions = emb.length;
             model = 'Xenova/all-MiniLM-L6-v2';
           }
@@ -585,6 +756,17 @@ export async function bridgeStoreEntry(options: {
           tags, metadata, created_at, updated_at, expires_at, status
         ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, 'active')`;
 
+    // #1941: provision a `vector_indexes` row for this namespace before the
+    // entry insert. AgentDB's HNSW/router keys lookups by namespace via this
+    // table — if it has no row for e.g. `claude-memories`, `memory_search`
+    // returns 0 results even when memory_entries holds hundreds of rows for
+    // that namespace. INSERT OR IGNORE so existing index rows are preserved.
+    try {
+      ctx.db
+        .prepare(`INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, ?)`)
+        .run(namespace, namespace, dimensions || 384);
+    } catch { /* vector_indexes may not exist on legacy DBs — fall through */ }
+
     const stmt = ctx.db.prepare(insertSql);
     stmt.run(
       id, key, namespace, value,
@@ -594,6 +776,33 @@ export async function bridgeStoreEntry(options: {
       now, now,
       ttl ? now + (ttl * 1000) : null
     );
+
+    // #2558: keep `vector_indexes.total_vectors` accurate so status/tooling
+    // stop reporting "HNSW index: 0 vectors" while embedded entries exist.
+    try {
+      ctx.db
+        .prepare(
+          `UPDATE vector_indexes SET
+             total_vectors = (SELECT COUNT(*) FROM memory_entries
+                              WHERE namespace = ? AND embedding IS NOT NULL),
+             updated_at = ?
+           WHERE name = ?`,
+        )
+        .run(namespace, now, namespace);
+    } catch { /* vector_indexes may not exist on legacy DBs — non-fatal */ }
+
+    // #2558: better-sqlite3 opens the DB in WAL mode and, for the small write
+    // volumes typical of CLI usage, may never reach the auto-checkpoint
+    // threshold — leaving committed rows only in the -wal file. WAL-blind
+    // readers (the sql.js fallback search path; the statusline's read-only
+    // `sqlite3` vector count) then see a stale/empty main DB file and report
+    // "0 vectors" / empty search. A PASSIVE checkpoint flushes committed pages
+    // into the main file without blocking writers. Best-effort, never fatal.
+    try {
+      if (typeof ctx.db.pragma === 'function') {
+        ctx.db.pragma('wal_checkpoint(PASSIVE)');
+      }
+    } catch { /* non-WAL, busy, or unsupported — non-fatal */ }
 
     // Phase 2: Write-through to TieredCache
     const safeNs = String(namespace).replace(/:/g, '_');
@@ -608,12 +817,13 @@ export async function bridgeStoreEntry(options: {
       success: true,
       id,
       embedding: embeddingJson ? { dimensions, model } : undefined,
-      rawEmbedding: embeddingJson ? JSON.parse(embeddingJson) as number[] : undefined,
+      rawEmbedding: embeddingArr ?? undefined,
       guarded: true,
       cached: true,
       attested: true,
     };
-  } catch {
+  } catch (err) {
+    logDemotionOnce('bridgeStoreEntry', err instanceof Error ? err.message : String(err));
     return null;
   }
 }
@@ -684,14 +894,19 @@ export async function bridgeSearchEntries(options: {
       return null;
     }
 
-    // Phase 2: Compute BM25 term stats for the corpus
+    // Phase 2: Compute BM25 term stats for the corpus. Tokenize the corpus a
+    // single time and reuse the per-doc `{contentLower, words}` for term-freq,
+    // BM25 scoring, and the coverage floor below.
     const queryTerms = queryStr.toLowerCase().split(/\s+/).filter(t => t.length > 1);
-    const { termDocFreqs, avgDocLength } = computeTermDocFreqs(queryTerms, rows);
+    const docs = tokenizeCorpus(rows);
+    const { termDocFreqs, avgDocLength } = computeTermDocFreqs(queryTerms, docs);
     const docCount = rows.length;
 
     const results: { id: string; key: string; content: string; score: number; namespace: string; provenance?: string }[] = [];
 
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const doc = docs[i];
       let semanticScore = 0;
       let bm25ScoreVal = 0;
 
@@ -707,23 +922,40 @@ export async function bridgeSearchEntries(options: {
 
       // Phase 2: BM25 keyword scoring (replaces String.includes fallback)
       if (queryTerms.length > 0 && row.content) {
-        bm25ScoreVal = bm25Score(queryTerms, row.content, avgDocLength, docCount, termDocFreqs);
+        bm25ScoreVal = bm25Score(queryTerms, doc.words, doc.words.length, avgDocLength, docCount, termDocFreqs);
         // Normalize BM25 to 0-1 range (cap at 10 for normalization)
         bm25ScoreVal = Math.min(bm25ScoreVal / 10, 1.0);
       }
 
-      // Reciprocal rank fusion: combine semantic and BM25
-      // Weight: 0.7 semantic + 0.3 BM25 when both embeddings present
-      // Fall back to BM25-only when either query or row lacks an embedding
-      const score = semanticScore > 0
-        ? (0.7 * semanticScore + 0.3 * bm25ScoreVal)
-        : bm25ScoreVal;
+      // #2558: keyword-coverage floor for the lexical signal.
+      // BM25's IDF collapses toward zero when a term appears in most/all
+      // documents (routine on small memory corpora), and the /10 normalization
+      // crushed exact-keyword hits well below the default 0.3 threshold — so
+      // `memory search` recalled NOTHING even when the content literally
+      // contained the query term (issue #2558: "keyword recall random"). The
+      // pre-BM25 fallback guaranteed keyword recall via matchCount/words*0.5;
+      // this restores that guarantee. `coverage` is the fraction of query
+      // terms present in the document — a full-coverage hit must always be
+      // recallable regardless of IDF.
+      const contentLower = doc.contentLower;
+      const matchedTerms = queryTerms.filter(t => contentLower.includes(t)).length;
+      const coverage = queryTerms.length > 0 ? matchedTerms / queryTerms.length : 0;
+      const lexicalScore = Math.max(bm25ScoreVal, coverage);
+
+      // Recall-friendly fusion: a strong semantic OR lexical signal alone must
+      // clear the threshold. `blended` (0.6 semantic + 0.4 lexical) drives
+      // ranking; taking max() with the raw semantic score means (a) a genuinely
+      // similar entry is never dropped just because it lacks the query's exact
+      // words, and (b) a full-coverage keyword hit (lexical=1 → blended≥0.4) is
+      // never dropped just because its embedding cosine is low or negative.
+      const blended = 0.6 * Math.max(0, semanticScore) + 0.4 * lexicalScore;
+      const score = Math.max(blended, semanticScore);
 
       if (score >= threshold) {
         // Phase 4: ExplainableRecall provenance
         const provenance = queryEmbedding
-          ? `semantic:${semanticScore.toFixed(3)}+bm25:${bm25ScoreVal.toFixed(3)}`
-          : `bm25:${bm25ScoreVal.toFixed(3)}`;
+          ? `semantic:${semanticScore.toFixed(3)}+lexical:${lexicalScore.toFixed(3)}`
+          : `lexical:${lexicalScore.toFixed(3)}`;
 
         results.push({
           id: String(row.id).substring(0, 12),
@@ -757,6 +989,8 @@ export async function bridgeListEntries(options: {
   limit?: number;
   offset?: number;
   dbPath?: string;
+  /** #2073: When true, include the entry's full `content` string in each result. */
+  includeContent?: boolean;
 }): Promise<{
   success: boolean;
   entries: {
@@ -768,6 +1002,8 @@ export async function bridgeListEntries(options: {
     createdAt: string;
     updatedAt: string;
     hasEmbedding: boolean;
+    /** #2073: Present when `includeContent: true` was requested. */
+    content?: string;
   }[];
   total: number;
   error?: string;
@@ -784,11 +1020,21 @@ export async function bridgeListEntries(options: {
     const nsFilter = namespace ? `AND namespace = ?` : '';
     const nsParams = namespace ? [namespace] : [];
 
+    // #2120 — `status IS NULL` accepted alongside `'active'`. Old
+    // databases imported by the auto-memory bridge (before the status
+    // column existed) end up with NULL status after schema migration if
+    // the migration ran on an existing DB without a backfill. Reporter
+    // @alexandrelealbess on WSL2 had 251 entries with NULL status, so
+    // the `status = 'active'` filter matched zero. Treat NULL as
+    // "legacy-active" — the safe default for any entry that predates the
+    // status column.
+    const statusFilter = `(status = 'active' OR status IS NULL)`;
+
     // Count
     let total = 0;
     try {
       const countStmt = ctx.db.prepare(
-        `SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' ${nsFilter}`
+        `SELECT COUNT(*) as cnt FROM memory_entries WHERE ${statusFilter} ${nsFilter}`
       );
       const countRow = countStmt.get(...nsParams);
       total = countRow?.cnt ?? 0;
@@ -802,14 +1048,16 @@ export async function bridgeListEntries(options: {
       const stmt = ctx.db.prepare(`
         SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at
         FROM memory_entries
-        WHERE status = 'active' ${nsFilter}
+        WHERE ${statusFilter} ${nsFilter}
         ORDER BY updated_at DESC
         LIMIT ? OFFSET ?
       `);
       const rows = stmt.all(...nsParams, limit, offset);
       for (const row of rows) {
-        entries.push({
-          id: String(row.id).substring(0, 20),
+        const entry: Record<string, unknown> = {
+          // #2073: don't truncate id when content is requested — callers
+          // (notably memory_export) need the full id to round-trip via import.
+          id: options.includeContent ? String(row.id) : String(row.id).substring(0, 20),
           key: row.key || String(row.id).substring(0, 15),
           namespace: row.namespace || 'default',
           size: (row.content || '').length,
@@ -817,7 +1065,11 @@ export async function bridgeListEntries(options: {
           createdAt: row.created_at || new Date().toISOString(),
           updatedAt: row.updated_at || new Date().toISOString(),
           hasEmbedding: !!(row.embedding && String(row.embedding).length > 10),
-        });
+        };
+        if (options.includeContent) {
+          entry.content = row.content || '';
+        }
+        entries.push(entry);
       }
     } catch {
       return null;
@@ -934,7 +1186,8 @@ export async function bridgeGetEntry(options: {
     await cacheSet(registry, cacheKey, entry);
 
     return { success: true, found: true, cacheHit: false, entry };
-  } catch {
+  } catch (err) {
+    logDemotionOnce('bridgeGetEntry', err instanceof Error ? err.message : String(err));
     return null;
   }
 }
@@ -1010,7 +1263,73 @@ export async function bridgeDeleteEntry(options: {
       remainingEntries: remaining,
       guarded: true,
     };
-  } catch {
+  } catch (err) {
+    logDemotionOnce('bridgeDeleteEntry', err instanceof Error ? err.message : String(err));
+    return null;
+  }
+}
+
+// #2666 — Hard, namespace-scoped purge. bridgeDeleteEntry above only ever
+// soft-deletes a single (namespace, key); this is a real
+// `DELETE FROM memory_entries WHERE namespace = ?` against the live
+// better-sqlite3-style handle, for callers (e.g. a plugin's index-reconcile
+// step) that need a namespace to be genuinely empty rather than tombstoned.
+// Irreversible — callers must gate this behind an explicit confirmation.
+export async function bridgePurgeNamespace(options: {
+  namespace: string;
+  dbPath?: string;
+}): Promise<{
+  success: boolean;
+  deletedCount: number;
+  remainingEntries: number;
+  guarded?: boolean;
+  error?: string;
+} | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+
+  const ctx = getDb(registry);
+  if (!ctx) return null;
+
+  try {
+    const { namespace } = options;
+
+    const guardResult = await guardValidate(registry, 'purge', { namespace });
+    if (!guardResult.allowed) {
+      return { success: false, deletedCount: 0, remainingEntries: 0, error: `MutationGuard rejected: ${guardResult.reason}` };
+    }
+
+    let deletedCount = 0;
+    try {
+      const result = ctx.db.prepare(`DELETE FROM memory_entries WHERE namespace = ?`).run(namespace);
+      deletedCount = result?.changes ?? 0;
+    } catch (e) {
+      return { success: false, deletedCount: 0, remainingEntries: 0, error: e instanceof Error ? e.message : String(e) };
+    }
+
+    const safeNs = String(namespace).replace(/:/g, '_');
+    await cacheInvalidate(registry, `namespace:${safeNs}`);
+
+    if (deletedCount > 0) {
+      await logAttestation(registry, 'purge', namespace, { namespace, deletedCount });
+    }
+
+    let remaining = 0;
+    try {
+      const row = ctx.db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`).get();
+      remaining = row?.cnt ?? 0;
+    } catch {
+      // Non-fatal
+    }
+
+    return {
+      success: true,
+      deletedCount,
+      remainingEntries: remaining,
+      guarded: true,
+    };
+  } catch (err) {
+    logDemotionOnce('bridgePurgeNamespace', err instanceof Error ? err.message : String(err));
     return null;
   }
 }
@@ -1024,7 +1343,7 @@ export async function bridgeDeleteEntry(options: {
 export async function bridgeGenerateEmbedding(
   text: string,
   dbPath?: string,
-): Promise<{ embedding: number[]; dimensions: number; model: string } | null> {
+): Promise<{ embedding: number[]; dimensions: number; model: string; backend?: 'onnx' | 'mock' } | null> {
   const registry = await getRegistry(dbPath);
   if (!registry) return null;
 
@@ -1036,10 +1355,29 @@ export async function bridgeGenerateEmbedding(
     const emb = await embedder.embed(text);
     if (!emb) return null;
 
+    // AUDIT #3: surface backend truthfully. AgentDB's embedder is a real ONNX
+    // model when present; if it ever exposes a mock/stub signal, honor it.
+    const isMock = (embedder as { isMock?: boolean; backend?: string }).isMock === true
+      || (embedder as { backend?: string }).backend === 'mock';
+
+    // #2395 — AgentDB's vectorBackend controller may initialize as
+    // `enabled: false` (e.g., ruvector isn't wired into its neural substrate
+    // yet) and silently fall back to a 128-dim hash stub. The embedder doesn't
+    // expose isMock=true in that path, so the wrapper above was reporting
+    // backend='onnx' on what's actually 128-dim hash garbage. The model name
+    // we hardcode ('Xenova/all-MiniLM-L6-v2') always produces 384-dim, so a
+    // dimensions mismatch is a definitive stub signal: return null and let
+    // the caller fall through to generateLocalEmbedding which routes to
+    // transformers.js / ruvector ONNX directly.
+    if (emb.length !== 384) {
+      return null;
+    }
+
     return {
       embedding: Array.from(emb),
       dimensions: emb.length,
       model: 'Xenova/all-MiniLM-L6-v2',
+      backend: isMock ? 'mock' : 'onnx',
     };
   } catch {
     return null;
@@ -1419,6 +1757,42 @@ export async function bridgeSearchPatterns(options: {
       };
     }
 
+    // #2226 — the wired-in LocalReasoningBank implements store() + findSimilar()/getAll()
+    // but NOT searchPatterns()/search(). bridgeStorePattern commits patterns to its
+    // store(), so search MUST read the SAME backend or stored patterns are never found
+    // (previously search fell through to the disjoint sql.js 'pattern' namespace, which
+    // the store never wrote to → always-empty results). Adapt findSimilar (semantic) with
+    // a getAll() substring fallback so freshly-stored patterns are visible. This mirrors
+    // what hooks_intelligence_pattern-search already does against the same backend.
+    if (reasoningBank && typeof reasoningBank.findSimilar === 'function') {
+      const k = options.topK || 5;
+      const threshold = options.minConfidence ?? 0.3;
+      let mapped: Array<{ id: string; content: string; score: number }> = [];
+      try {
+        const { generateEmbedding } = await import('./memory-initializer.js');
+        const qEmb = await generateEmbedding(options.query);
+        if (qEmb && Array.isArray(qEmb.embedding) && qEmb.embedding.length > 0) {
+          const hits = reasoningBank.findSimilar(qEmb.embedding, { k, threshold });
+          mapped = (Array.isArray(hits) ? hits : []).map((r: any) => ({
+            id: r.id ?? '',
+            content: r.content ?? '',
+            score: r.confidence ?? r.score ?? 0,
+          }));
+        }
+      } catch { /* embedding unavailable — fall through to substring scan */ }
+
+      // Deterministic substring fallback over the same in-memory store.
+      if (mapped.length === 0 && typeof reasoningBank.getAll === 'function') {
+        const q = options.query.toLowerCase();
+        mapped = (reasoningBank.getAll() as any[])
+          .filter((p: any) => typeof p.content === 'string' && p.content.toLowerCase().includes(q))
+          .slice(0, k)
+          .map((p: any) => ({ id: p.id ?? '', content: p.content ?? '', score: p.confidence ?? 0 }));
+      }
+
+      return { results: mapped, controller: 'reasoningBank' };
+    }
+
     // Fallback: search via bridge
     const result = await bridgeSearchEntries({
       query: options.query,
@@ -1451,6 +1825,12 @@ export async function bridgeRecordFeedback(options: {
   duration?: number;
   patterns?: string[];
   dbPath?: string;
+  // ADR-147 P2: nested-subagent spawn tree capture.
+  // parentAgentId is sourced from Claude Code's `parent_agent_id` OTel span tag
+  // (header `x-claude-code-parent-agent-id`). depth is the chain length from the
+  // root lead session (0 = lead, 1+ = subagent). Both undefined for top-level work.
+  parentAgentId?: string;
+  depth?: number;
 }): Promise<{ success: boolean; controller: string; updated: number } | null> {
   const registry = await getRegistry(options.dbPath);
   if (!registry) return null;
@@ -1467,6 +1847,8 @@ export async function bridgeRecordFeedback(options: {
           await learningSystem.recordFeedback({
             taskId: options.taskId, success: options.success, quality: options.quality,
             agent: options.agent, duration: options.duration, timestamp: Date.now(),
+            // ADR-147 P2: forward spawn-tree lineage if present
+            parentAgentId: options.parentAgentId, depth: options.depth,
           });
           controller = 'learningSystem';
           updated++;
@@ -2094,10 +2476,22 @@ export async function bridgeHealthCheck(
  *
  * Real HierarchicalMemory API (agentdb alpha.10+):
  *   store(content, importance?, tier?, options?) → Promise<string>
- * Stub API (fallback):
- *   store(key, value, tier) — synchronous
+ * Fallback API (@claude-flow/memory TieredMemoryStore):
+ *   store(key, value, tier, temporalOptions?) — synchronous, returns
+ *   { id, key, tier, superseded? }
+ *
+ * Temporal validity (Zep/Graphiti-style, impl/memory-sota):
+ * - validFrom / validUntil (ISO) travel with the entry.
+ * - supersedes=<entryId|key> INVALIDATES the old entry (validUntil=now +
+ *   supersededBy=newId) instead of deleting it. Natively supported by the
+ *   TieredMemoryStore fallback; on the real agentdb HierarchicalMemory the
+ *   temporal fields are stored in metadata, and supersede is reported as
+ *   unsupported (no public update API) rather than silently dropped.
  */
-export async function bridgeHierarchicalStore(params: { key: string; value: string; tier?: string; importance?: number }): Promise<any> {
+export async function bridgeHierarchicalStore(params: {
+  key: string; value: string; tier?: string; importance?: number;
+  validFrom?: string; validUntil?: string; supersedes?: string;
+}): Promise<any> {
   const registry = await getRegistry();
   if (!registry) return null;
   try {
@@ -2107,15 +2501,34 @@ export async function bridgeHierarchicalStore(params: { key: string; value: stri
 
     // Detect real HierarchicalMemory (has async store returning id) vs stub
     if (typeof hm.getStats === 'function' && typeof hm.promote === 'function') {
-      // Real agentdb HierarchicalMemory
+      // Real agentdb HierarchicalMemory — temporal fields ride in metadata
+      // so bridgeHierarchicalRecall can filter on them.
+      const metadata: Record<string, unknown> = { key: params.key };
+      if (params.validFrom) metadata.validFrom = params.validFrom;
+      if (params.validUntil) metadata.validUntil = params.validUntil;
       const id = await hm.store(params.value, params.importance || 0.5, tier, {
-        metadata: { key: params.key },
+        metadata,
         tags: [params.key],
       });
-      return { success: true, id, key: params.key, tier };
+      const result: any = { success: true, id, key: params.key, tier };
+      if (params.supersedes) {
+        // No public update/invalidate API on agentdb HierarchicalMemory —
+        // surface the limitation honestly instead of silently dropping it.
+        result.superseded = null;
+        result.warning = 'supersedes is not supported by the native agentdb HierarchicalMemory backend (no update API); the referenced entry was left untouched';
+      }
+      return result;
     }
-    // Stub fallback
-    hm.store(params.key, params.value, tier);
+    // TieredMemoryStore fallback (temporal-aware) / legacy stub
+    const storeResult = hm.store(params.key, params.value, tier, {
+      validFrom: params.validFrom,
+      validUntil: params.validUntil,
+      supersedes: params.supersedes,
+    });
+    if (storeResult && typeof storeResult === 'object') {
+      return { success: true, ...storeResult };
+    }
+    // Legacy stub (returns void) — temporal options were ignored
     return { success: true, key: params.key, tier };
   } catch (e: any) { return { success: false, error: e.message }; }
 }
@@ -2129,7 +2542,7 @@ export async function bridgeHierarchicalStore(params: { key: string; value: stri
  * Stub API (fallback):
  *   recall(query: string, topK: number) → synchronous array
  */
-export async function bridgeHierarchicalRecall(params: { query: string; tier?: string; topK?: number }): Promise<any> {
+export async function bridgeHierarchicalRecall(params: { query: string; tier?: string; topK?: number; includeExpired?: boolean }): Promise<any> {
   const registry = await getRegistry();
   if (!registry) return null;
   try {
@@ -2147,11 +2560,33 @@ export async function bridgeHierarchicalRecall(params: { query: string; tier?: s
         memoryQuery.tier = params.tier;
       }
       const results = await hm.recall(memoryQuery);
-      return { results: results || [], controller: 'hierarchicalMemory' };
+      // Temporal filter over metadata (validFrom/validUntil stamped by
+      // bridgeHierarchicalStore). Entries without the fields are always
+      // valid — legacy behavior unchanged.
+      const filtered = params.includeExpired
+        ? (results || [])
+        : (results || []).filter((r: any) => {
+            const meta = r?.metadata || {};
+            const now = Date.now();
+            if (meta.validFrom) {
+              const from = Date.parse(String(meta.validFrom));
+              if (!Number.isNaN(from) && from > now) return false;
+            }
+            if (meta.validUntil) {
+              const until = Date.parse(String(meta.validUntil));
+              if (!Number.isNaN(until) && until <= now) return false;
+            }
+            return true;
+          });
+      return { results: filtered, controller: 'hierarchicalMemory' };
     }
 
-    // Stub fallback — recall(string, number)
-    const results = hm.recall(params.query, params.topK || 5);
+    // TieredMemoryStore fallback — recall(string, number, options?).
+    // Temporal filtering happens inside the store; the legacy stub simply
+    // ignores the extra argument.
+    const results = hm.recall(params.query, params.topK || 5, {
+      includeExpired: params.includeExpired === true,
+    });
     const filtered = params.tier
       ? results.filter((r: any) => r.tier === params.tier)
       : results;
@@ -2367,4 +2802,47 @@ function cosineSim(a: number[], b: number[]): number {
   }
   const mag = Math.sqrt(normA * normB);
   return mag === 0 ? 0 : dot / mag;
+}
+
+/**
+ * Public helper for the unified learning-stats aggregator: counts of entries
+ * per namespace + the top-level total. Best-effort — if the bridge isn't
+ * available it returns zeros so the aggregator can still report the other
+ * stores honestly. (#2245 follow-up.)
+ */
+export async function getMemoryBridgeStats(options: {
+  namespaces?: string[];
+  dbPath?: string;
+} = {}): Promise<{
+  totalEntries: number;
+  perNamespace: Record<string, number>;
+  source: string;
+  reachable: boolean;
+}> {
+  const namespaces = options.namespaces ?? [
+    'default', 'patterns', 'claude-memories', 'auto-memory',
+    'tasks', 'feedback', 'pretrain', 'trajectories',
+  ];
+  try {
+    const all = await bridgeListEntries({ dbPath: options.dbPath, limit: 1 });
+    if (!all) {
+      return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (unreachable)', reachable: false };
+    }
+    const perNamespace: Record<string, number> = {};
+    for (const ns of namespaces) {
+      try {
+        const r = await bridgeListEntries({ namespace: ns, dbPath: options.dbPath, limit: 1 });
+        const n = r?.total ?? 0;
+        if (n > 0) perNamespace[ns] = n;
+      } catch { /* skip per-namespace failure */ }
+    }
+    return {
+      totalEntries: all.total,
+      perNamespace,
+      source: 'memory-bridge AgentDB (bridgeListEntries)',
+      reachable: true,
+    };
+  } catch {
+    return { totalEntries: 0, perNamespace: {}, source: 'memory-bridge (error)', reachable: false };
+  }
 }

@@ -109,6 +109,75 @@ export {
   type VerificationCode,
 } from './token-generator.js';
 
+// Tool-Output Guardrail (ADR-131 — closes OWASP ASI01 gap; ruvnet/ruflo#2149)
+export {
+  ToolOutputGuardrail,
+  createToolOutputGuardrail,
+  isToolOutputSafe,
+  type GuardrailConfig,
+  type GuardrailResult,
+  type GuardrailAction,
+  type InjectionFinding,
+  type InjectionSeverity,
+  type InjectionCategory,
+} from './tool-output-guardrail.js';
+
+// Agent Authorization Propagation (ADR-144 P1 — ruvnet/ruflo#2248)
+// Action-layer: SendMessage envelope + per-action scope check + MCP server
+// identity probe. Wraps the comms layer in P2; wraps the dispatcher in P3.
+export {
+  AgentAuthorizationPropagator,
+  AuthorizationPropagationError,
+  makeLegacyPermissiveScope,
+  type AuthScope,
+  type SendMessageEnvelope,
+  type ToolCallDecision,
+} from './authorization/propagator.js';
+
+// OAuth 2.0 + PKCE + OS Keychain (ADR-306)
+// A TypeScript port of meta-proxy's proven oauth/{client,pkce,browser,
+// callback_server}.rs — see src/oauth/client.ts for why this targets the
+// live auth.cognitum.one surface rather than ADR-308's unconfirmed spec.
+export {
+  CLIENT_ID as OAUTH_CLIENT_ID,
+  SCOPE as OAUTH_SCOPE,
+  OOB_REDIRECT_URI,
+  OAuthError,
+  authorizeUrl,
+  exchangeCode,
+  refreshToken,
+  exchangeManualCode,
+  type TokenResponse as OAuthTokenResponse,
+} from './oauth/client.js';
+export { generate as generatePkce, challengeFromVerifier, type PkceRequest } from './oauth/pkce.js';
+export { CallbackServer, CallbackTimeoutError, type CallbackResult } from './oauth/callback-server.js';
+export { openBrowser } from './oauth/browser.js';
+
+// OS Keychain Adapter (ADR-306)
+export {
+  createKeychainAdapter,
+  SessionOnlyKeychainAdapter,
+  type KeychainAdapter,
+} from './keychain-adapter.js';
+
+// Plugin Integrity Verifier (ADR-145 P1 — ruvnet/ruflo#2254)
+// Install-layer: Ed25519 signature verification + trust-anchor allowlist.
+// Stage-2 semantic-intent scan (SCH defence) lands in P2.
+export {
+  PluginIntegrityVerifier,
+  canonicalize,
+  hashManifest,
+  fingerprint,
+  findAnchor,
+  type PluginManifest,
+  type SignedPluginManifest,
+  type TrustAnchor,
+  type TrustAnchors,
+  type VerificationStatus,
+  type VerificationResult,
+  type VerifierConfig,
+} from './plugins/integrity-verifier.js';
+
 // ============================================================================
 // Convenience Factory Functions
 // ============================================================================
