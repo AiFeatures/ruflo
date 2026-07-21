@@ -7,6 +7,8 @@ import type { Command, CommandContext, CommandResult } from '../types.js';
 import { output } from '../output.js';
 import { select, confirm, input } from '../prompt.js';
 import { callMCPTool, MCPClientError } from '../mcp-client.js';
+import { distillCommand } from './memory-distill.js';
+import { backupCommand } from './memory-backup.js';
 
 // Memory backends
 const BACKENDS = [
@@ -15,6 +17,15 @@ const BACKENDS = [
   { value: 'hybrid', label: 'Hybrid', hint: 'SQLite + AgentDB (recommended)' },
   { value: 'memory', label: 'In-Memory', hint: 'Fast but non-persistent' }
 ];
+// #2105: shared --path option for memory subcommands.
+// Precedence: --path > CLAUDE_FLOW_DB_PATH env var > default root
+const DB_PATH_OPTION = {
+  name: 'path',
+  description:
+    'Override DB file path (also: CLAUDE_FLOW_DB_PATH env var). ' +
+    'Precedence: --path > CLAUDE_FLOW_DB_PATH > CLAUDE_FLOW_MEMORY_PATH/memory.db > cwd/.swarm/memory.db',
+  type: 'string' as const,
+};
 
 // Store command
 const storeCommand: Command = {
@@ -60,20 +71,26 @@ const storeCommand: Command = {
     {
       name: 'upsert',
       short: 'u',
-      description: 'Update if key exists (insert or replace)',
+      // #2594: default true so `store → delete → store` doesn't hit the UNIQUE
+      // (namespace, key) constraint on the soft-deleted row. Pass --no-upsert
+      // for strict insert semantics.
+      description: 'Update if key exists (default; pass --no-upsert for strict insert)',
       type: 'boolean',
-      default: false
-    }
+      default: true
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory store -k "api/auth" -v "JWT implementation"', description: 'Store text' },
     { command: 'claude-flow memory store -k "pattern/singleton" --vector', description: 'Store vector' },
-    { command: 'claude-flow memory store -k "pattern" -v "updated" --upsert', description: 'Update existing' }
+    { command: 'claude-flow memory store -k "pattern" -v "new" --no-upsert', description: 'Strict insert (fail if key exists)' }
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const key = ctx.flags.key as string;
     let value = ctx.flags.value as string || ctx.args[0];
-    const namespace = ctx.flags.namespace as string;
+    // #2461: without `|| 'default'`, omitting -n stores under the literal
+    // string namespace "undefined" — silent data loss for first-time users.
+    const namespace = (ctx.flags.namespace as string) || 'default';
     const ttl = ctx.flags.ttl as number;
     const tags = ctx.flags.tags ? (ctx.flags.tags as string).split(',') : [];
     const asVector = ctx.flags.vector as boolean;
@@ -111,7 +128,8 @@ const storeCommand: Command = {
 
     // Use direct sql.js storage with automatic embedding generation
     try {
-      const { storeEntry } = await import('../memory/memory-initializer.js');
+      const { storeEntry, resolveDbPath: _rdbStore } = await import('../memory/memory-initializer.js');
+      const dbPath = _rdbStore(ctx.flags.path as string | undefined);
 
       if (asVector) {
         output.writeln(output.dim('  Generating embedding vector...'));
@@ -124,7 +142,8 @@ const storeCommand: Command = {
         generateEmbeddingFlag: true, // Always generate embeddings for semantic search
         tags,
         ttl,
-        upsert
+        upsert,
+        dbPath
       });
 
       if (!result.success) {
@@ -178,11 +197,27 @@ const retrieveCommand: Command = {
       description: 'Memory namespace',
       type: 'string',
       default: 'default'
-    }
+    },
+    // #2073: --format is the GLOBAL option (parser.ts:78) with choices
+    // ['text', 'json', 'table'] and default 'text'. The retrieve handler
+    // discriminates: 'json' emits parseable JSON, anything else (text/box/...)
+    // emits the human-readable box. No per-command override needed; we just
+    // document the behavior in the help text via examples.
+    {
+      // #2073: --value-only emits ONLY the value string (no wrapper).
+      // Designed for piping into JSON.parse without any cleanup.
+      name: 'value-only',
+      description: 'Print only the stored value to stdout (no wrapper)',
+      type: 'boolean',
+      default: false
+    },
+    DB_PATH_OPTION
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const key = ctx.flags.key as string || ctx.args[0];
-    const namespace = ctx.flags.namespace as string;
+    // #2461: mirror the store-side default so `memory retrieve -k k` (no -n)
+    // looks under "default" rather than the literal namespace "undefined".
+    const namespace = (ctx.flags.namespace as string) || 'default';
 
     if (!key) {
       output.printError('Key is required');
@@ -191,8 +226,9 @@ const retrieveCommand: Command = {
 
     // Use sql.js directly for consistent data access
     try {
-      const { getEntry } = await import('../memory/memory-initializer.js');
-      const result = await getEntry({ key, namespace });
+      const { getEntry, resolveDbPath: _rdbRetrieve } = await import('../memory/memory-initializer.js');
+      const dbPathRetrieve = _rdbRetrieve(ctx.flags.path as string | undefined);
+      const result = await getEntry({ key, namespace, dbPath: dbPathRetrieve });
 
       if (!result.success) {
         output.printError(`Failed to retrieve: ${result.error}`);
@@ -205,6 +241,17 @@ const retrieveCommand: Command = {
       }
 
       const entry = result.entry;
+
+      // #2073: --value-only emits just the raw value (no decoration) for
+      // piping into JSON.parse / jq / other downstream parsers without
+      // any cleanup.
+      if (ctx.flags['value-only'] || ctx.flags.valueOnly) {
+        // Use process.stdout.write directly to bypass any printer-side
+        // transformation of quotes/structural characters.
+        process.stdout.write(entry.content);
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        return { success: true, data: entry };
+      }
 
       if (ctx.flags.format === 'json') {
         output.printJson(entry);
@@ -286,7 +333,8 @@ const searchCommand: Command = {
       description: 'Use SmartRetrieval pipeline (query expansion, RRF, MMR, recency)',
       type: 'boolean',
       default: false
-    }
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory search -q "authentication patterns"', description: 'Semantic search' },
@@ -338,7 +386,8 @@ const searchCommand: Command = {
 
     // Use direct sql.js search with vector similarity
     try {
-      const { searchEntries } = await import('../memory/memory-initializer.js');
+      const { searchEntries, resolveDbPath: _rdbSearch } = await import('../memory/memory-initializer.js');
+      const dbPathSearch = _rdbSearch(ctx.flags.path as string | undefined);
       const useSmart = (ctx.flags.smart || ctx.flags.s) as boolean;
 
       let results: { key: string; score: number; namespace: string; preview: string }[];
@@ -376,6 +425,7 @@ const searchCommand: Command = {
             namespace: req.namespace || namespace,
             limit: req.limit || limit * 3,
             threshold: req.threshold ?? threshold,
+            dbPath: dbPathSearch,
           });
           return {
             results: r.results.map(e => ({
@@ -409,7 +459,8 @@ const searchCommand: Command = {
           query,
           namespace,
           limit,
-          threshold
+          threshold,
+          dbPath: dbPathSearch
         });
 
         if (!searchResult.success) {
@@ -490,7 +541,8 @@ const listCommand: Command = {
       description: 'Maximum entries',
       type: 'number',
       default: 20
-    }
+    },
+    DB_PATH_OPTION
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const namespace = ctx.flags.namespace as string;
@@ -498,8 +550,9 @@ const listCommand: Command = {
 
     // Use sql.js directly for consistent data access
     try {
-      const { listEntries } = await import('../memory/memory-initializer.js');
-      const listResult = await listEntries({ namespace, limit, offset: 0 });
+      const { listEntries, resolveDbPath: _rdbList } = await import('../memory/memory-initializer.js');
+      const dbPathList = _rdbList(ctx.flags.path as string | undefined);
+      const listResult = await listEntries({ namespace, limit, offset: 0, dbPath: dbPathList });
 
       if (!listResult.success) {
         output.printError(`Failed to list: ${listResult.error}`);
@@ -596,7 +649,8 @@ const deleteCommand: Command = {
       description: 'Skip confirmation',
       type: 'boolean',
       default: false
-    }
+    },
+    DB_PATH_OPTION
   ],
   examples: [
     { command: 'claude-flow memory delete -k "mykey"', description: 'Delete entry with default namespace' },
@@ -628,8 +682,9 @@ const deleteCommand: Command = {
 
     // Use sql.js directly for consistent data access (Issue #980)
     try {
-      const { deleteEntry } = await import('../memory/memory-initializer.js');
-      const result = await deleteEntry({ key, namespace });
+      const { deleteEntry, resolveDbPath: _rdbDelete } = await import('../memory/memory-initializer.js');
+      const dbPathDelete = _rdbDelete(ctx.flags.path as string | undefined);
+      const result = await deleteEntry({ key, namespace, dbPath: dbPathDelete });
 
       if (!result.success) {
         output.printError(result.error || 'Failed to delete');
@@ -651,15 +706,108 @@ const deleteCommand: Command = {
   }
 };
 
+// #2666 — Hard, namespace-scoped purge. `delete` above only ever
+// soft-deletes a single key (status='deleted', row stays and still occupies
+// the UNIQUE(namespace, key) slot — #2652). Reconciling an entire namespace
+// after its source-of-truth changed (e.g. a plugin's index after a source
+// file was removed) needs the row to actually be gone, not tombstoned.
+// Irreversible — always requires --namespace explicitly (no default) and
+// either interactive confirmation or --force.
+const purgeCommand: Command = {
+  name: 'purge',
+  description: 'Permanently delete every entry in a namespace (hard delete — not the soft delete/tombstone that `memory delete` uses)',
+  options: [
+    {
+      name: 'namespace',
+      short: 'n',
+      description: 'Namespace to purge (required — no default, to avoid an accidental whole-namespace wipe)',
+      type: 'string'
+    },
+    {
+      name: 'dry-run',
+      short: 'd',
+      description: 'Report how many entries would be deleted, without deleting them',
+      type: 'boolean',
+      default: false
+    },
+    {
+      name: 'force',
+      short: 'f',
+      description: 'Skip confirmation',
+      type: 'boolean',
+      default: false
+    },
+    DB_PATH_OPTION
+  ],
+  examples: [
+    { command: 'claude-flow memory purge --namespace stale-cache --dry-run', description: 'Preview a purge' },
+    { command: 'claude-flow memory purge --namespace stale-cache --force', description: 'Purge without confirmation (e.g. in a script)' }
+  ],
+  action: async (ctx: CommandContext): Promise<CommandResult> => {
+    const namespace = ctx.flags.namespace as string;
+    const dryRun = ctx.flags.dryRun as boolean;
+    const force = ctx.flags.force as boolean;
+    const dbPath = ctx.flags.path as string | undefined;
+
+    if (!namespace) {
+      output.printError('Namespace is required. Use: memory purge -n "namespace" [--dry-run | --force]');
+      return { success: false, exitCode: 1 };
+    }
+
+    try {
+      const { listEntries, purgeNamespace, resolveDbPath: _rdbPurge } = await import('../memory/memory-initializer.js');
+      const resolvedDbPath = _rdbPurge(dbPath);
+
+      const preview = await listEntries({ namespace, limit: 1, dbPath: resolvedDbPath });
+      const previewCount = preview.total ?? preview.entries?.length ?? 0;
+
+      if (dryRun) {
+        output.printInfo(`Would permanently delete ${previewCount} entr${previewCount === 1 ? 'y' : 'ies'} from namespace "${namespace}" (dry run — nothing deleted)`);
+        return { success: true, data: { namespace, wouldDelete: previewCount } };
+      }
+
+      if (!force && ctx.interactive) {
+        const confirmed = await confirm({
+          message: `Permanently delete ${previewCount} entr${previewCount === 1 ? 'y' : 'ies'} from namespace "${namespace}"? This is a hard delete — not reversible with \`memory delete\`'s soft-undo.`,
+          default: false
+        });
+        if (!confirmed) {
+          output.printInfo('Operation cancelled');
+          return { success: true };
+        }
+      } else if (!force) {
+        output.printError(`Refusing to purge namespace "${namespace}" without --force in non-interactive mode`);
+        return { success: false, exitCode: 1 };
+      }
+
+      const result = await purgeNamespace({ namespace, dbPath: resolvedDbPath });
+
+      if (!result.success) {
+        output.printError(result.error || 'Failed to purge');
+        return { success: false, exitCode: 1 };
+      }
+
+      output.printSuccess(`Purged ${result.deletedCount} entr${result.deletedCount === 1 ? 'y' : 'ies'} from namespace "${namespace}"`);
+      output.printInfo(`Remaining entries (all namespaces): ${result.remainingEntries}`);
+      return { success: true, data: result };
+    } catch (error) {
+      output.printError(`Failed to purge: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return { success: false, exitCode: 1 };
+    }
+  }
+};
+
 // Stats command
 const statsCommand: Command = {
   name: 'stats',
   description: 'Show memory statistics',
+  options: [DB_PATH_OPTION],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     // Call MCP memory/stats tool for real statistics
     try {
       const statsResult = await callMCPTool('memory_stats', {}) as {
         totalEntries: number;
+        entriesWithEmbeddings?: number;
         totalSize: string;
         version: string;
         backend: string;
@@ -768,11 +916,23 @@ const statsCommand: Command = {
             },
             {
               metric: 'HNSW Index',
-              value: hnsw.available && hnsw.initialized
-                ? output.success(`active (${hnsw.entryCount.toLocaleString()} entries)`)
-                : hnsw.available
-                  ? output.warning('available but not initialized')
-                  : output.dim('not active'),
+              // ruflo#1989 / #1987: `hnsw.entryCount` is in-process JS state
+              // (the live HNSW index of the current Node process). A fresh
+              // `memory stats` invocation has never indexed anything, so it
+              // reports 0 even when the persistent DB has thousands of
+              // entries with embeddings. Use the persistent count from the
+              // MCP tool (`entriesWithEmbeddings`, which is the actual
+              // count of rows that have a vector) as the source of truth.
+              value: (() => {
+                const persisted = typeof statsResult.entriesWithEmbeddings === 'number'
+                  ? statsResult.entriesWithEmbeddings
+                  : null;
+                const live = hnsw.entryCount || 0;
+                const total = persisted !== null ? Math.max(persisted, live) : live;
+                if (!hnsw.available) return output.dim('not active');
+                if (total === 0) return output.warning('available but not initialized');
+                return output.success(`active (${total.toLocaleString()} entries)`);
+              })(),
             },
           ]
         });
@@ -1619,7 +1779,7 @@ const initMemoryCommand: Command = {
 export const memoryCommand: Command = {
   name: 'memory',
   description: 'Memory management commands',
-  subcommands: [initMemoryCommand, storeCommand, retrieveCommand, searchCommand, listCommand, deleteCommand, statsCommand, configureCommand, cleanupCommand, compressCommand, exportCommand, importCommand],
+  subcommands: [initMemoryCommand, storeCommand, retrieveCommand, searchCommand, listCommand, deleteCommand, purgeCommand, statsCommand, configureCommand, cleanupCommand, compressCommand, exportCommand, importCommand, distillCommand, backupCommand],
   options: [],
   examples: [
     { command: 'claude-flow memory store -k "key" -v "value"', description: 'Store data' },
@@ -1645,7 +1805,8 @@ export const memoryCommand: Command = {
       `${output.highlight('cleanup')}    - Clean expired entries`,
       `${output.highlight('compress')}   - Compress database`,
       `${output.highlight('export')}     - Export memory to file`,
-      `${output.highlight('import')}     - Import from file`
+      `${output.highlight('import')}     - Import from file`,
+      `${output.highlight('distill')}    - Distill memory_entries into structured intelligence (ADR-174)`
     ]);
 
     return { success: true };
