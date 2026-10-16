@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "generation": 1,
-  "generatedAt": "2026-07-20T23:20:52.239Z",
-  "gitSha": "745dfbe3",
+  "generation": 6,
+  "generatedAt": "2026-09-17T21:28:47.530Z",
+  "gitSha": "702d1461",
   "catalog": {
-    "agents": 164,
-    "tools": 387,
+    "agents": 167,
+    "tools": 418,
     "skills": 34
   },
   "benchmark": null

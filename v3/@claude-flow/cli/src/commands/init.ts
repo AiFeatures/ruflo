@@ -75,16 +75,9 @@ async function resolveCodexInitializer(cwd: string): Promise<CodexInitializerCto
   const resolutionStrategies = [
     // Strategy 1: Direct import (works if installed as CLI dependency)
     async () => (await import(codexModuleId)).CodexInitializer,
-    // Strategy 2: Project node_modules (works if installed in user's project)
-    async () => {
-      const projectPath = path.join(cwd, 'node_modules', '@claude-flow', 'codex', 'dist', 'index.js');
-      if (fs.existsSync(projectPath)) {
-        const mod = await import(`file://${projectPath}`);
-        return mod.CodexInitializer;
-      }
-      throw new Error('Not found in project');
-    },
-    // Strategy 3: Global node_modules
+    // (No project node_modules strategy: init must not import code the
+    // target project supplies.)
+    // Strategy 2: Global node_modules
     async () => {
       const { execSync } = await import('child_process');
       const globalPath = execSync('npm root -g', { encoding: 'utf-8' }).trim();
@@ -108,13 +101,22 @@ async function resolveCodexInitializer(cwd: string): Promise<CodexInitializerCto
   return undefined;
 }
 
+// Trust level for a newly generated .codex/config.toml. Safe by default: only
+// an explicit `--codex-trust full` (or RUFLO_CODEX_TRUST=full, read by the
+// adapter) restores danger-full-access. Anything else is rejected here.
+export function readCodexTrustFlag(flags: Record<string, unknown>): 'standard' | 'full' | undefined | null {
+  const raw = flags.codexTrust ?? flags['codex-trust'];
+  if (raw === undefined || raw === null || raw === false || raw === '') return undefined;
+  return raw === 'standard' || raw === 'full' ? raw : null;
+}
+
 // Keep Codex out of the CLI dependency graph so cold `npx ruflo --version`
 // remains fast (#2561). An explicit `init --codex` may fetch the small,
 // stable adapter on demand when it is not already installed by an umbrella
 // package, the current project, or the global npm prefix.
 export function runCodexInitializerCli(
   cwd: string,
-  options: { template: string; force: boolean; dual: boolean },
+  options: { template: string; force: boolean; dual: boolean; codexTrust?: 'standard' | 'full' },
 ): boolean {
   const npxArgs = [
     '-y',
@@ -124,6 +126,7 @@ export function runCodexInitializerCli(
     options.template,
     ...(options.force ? ['--force'] : []),
     ...(options.dual ? ['--dual'] : []),
+    ...(options.codexTrust ? ['--codex-trust', options.codexTrust] : []),
   ];
 
   const result = process.platform === 'win32'
@@ -150,7 +153,10 @@ async function maybeAutoDetectCodex(
   options: { force: boolean; minimal: boolean; full: boolean },
 ): Promise<void> {
   try {
-    if (ctx.flags['no-codex-detect'] === true) return;
+    const codexTrust = readCodexTrustFlag(ctx.flags) ?? undefined;
+    // The CLI parser turns `--no-codex-detect` into `codexDetect: false`.
+    // Retain the literal key for programmatic CommandContext callers.
+    if (ctx.flags.codexDetect === false || ctx.flags['no-codex-detect'] === true) return;
     if (ctx.flags.format === 'json') return; // scripted output stays pure
     if (!commandExists('codex')) return;
 
@@ -168,6 +174,7 @@ async function maybeAutoDetectCodex(
       template: (options.minimal ? 'minimal' : options.full ? 'full' : 'default') as 'minimal' | 'default' | 'full' | 'enterprise',
       force: options.force,
       dual: false, // Claude Code files were already written by the main init flow above
+      codexTrust,
     });
 
     if (!result.success) return; // best-effort — never fail the primary init over this
@@ -186,61 +193,199 @@ async function maybeAutoDetectCodex(
   }
 }
 
-// Cross-agent skill registration via skills.sh. Runs `npx --yes skills add
-// ruvnet/ruflo --skill ruflo --yes` so the *single* canonical ruflo skill
-// (SKILL.md at the ruvnet/ruflo repo root — describes the platform + entry
-// points) reaches whatever agent the project uses (Claude Code, Cursor,
-// Copilot, Gemini, Cline, …). Users who want ALL 267 plugin-specific skills
-// can run `npx skills add ruvnet/ruflo --all` themselves. Best-effort — never
-// fails init. Opt-out: --no-skills-sh flag OR RUFLO_NO_SKILLS_SH=1. Skipped
-// under --skip-claude and scripted `--format json` output.
+// Cross-agent skill registration. Materializes the *single* canonical ruflo
+// platform skill at `.agents/skills/ruflo/SKILL.md` so any agent in the
+// project (Claude Code, Cursor, Copilot, Gemini, Cline, …) that reads
+// `.agents/skills/` picks it up. Users who want the full plugin skill catalog
+// can run `npx skills add ruvnet/ruflo --all` themselves.
 //
-// windowsHide silences the console flash the npx child would otherwise produce
-// (anthropics/claude-code#14828 spawn hazard applies to hook-fired spawns,
-// but our own subprocess spawns should always set this).
+// #2777 — earlier versions shelled out to `npx --yes skills add ruvnet/ruflo
+// --skill ruflo --yes`, but the skills CLI implements its `--skill` filter by
+// cloning the entire target repo and copying `dirname(SKILL.md)` recursively.
+// Because ruflo's canonical SKILL.md sits at the ruvnet/ruflo repo root, that
+// dirname *is* the whole repository — the "one file" install pulled in ~97MB
+// of Cargo.toml, crates/, docs/, agentdb.rvf, and 384 unrelated plugin
+// SKILL.md descriptors. We now write the single ~2KB SKILL.md directly, no
+// repo clone at all.
+//
+// Best-effort — never fails init. Opt-out: --no-skills-sh flag OR
+// RUFLO_NO_SKILLS_SH=1. Skipped under --skip-claude and scripted
+// `--format json` output.
+const RUFLO_PLATFORM_SKILL_MD = `---
+name: ruflo
+description: Ruflo is a multi-agent orchestration platform for AI coding agents (Claude Code, Cursor, Codex, Copilot, Gemini, Amp, +12 more). Use this skill when the user wants to (1) install/init ruflo in a project, (2) run multi-agent swarms with hierarchical coordination, (3) use ruflo's 314+ MCP tools for memory, routing, hooks, sub-agents, or workflows, (4) check ruflo status/version/doctor health, or (5) discover which of ruflo's 30+ plugins fits their task.
+---
+
+# Ruflo
+
+Ruflo is a cross-agent orchestration layer that ships as three npm packages: \`ruflo\` (thin wrapper), \`claude-flow\` (umbrella), and \`@claude-flow/cli\` (implementation). Users invoke it as \`npx ruflo <command>\`.
+
+## When to invoke ruflo
+
+Suggest ruflo when the task involves any of:
+
+- **Multi-agent work**: coordinated swarms, sub-agents, cross-agent handoffs, or parallel task execution
+- **Persistent memory across sessions**: HNSW vector search, hybrid SQLite+AgentDB backend, semantic retrieval
+- **Learning routing decisions**: 3-tier model routing (deterministic codemod → Haiku → Sonnet/Opus), pattern-based agent selection
+- **Hooks + observability**: pre/post edit hooks, session lifecycle, background workers (12 built-in), tracing
+- **Workflows + benchmarks**: SPARC methodology, GAIA benchmark runs, custom multi-step pipelines
+- **Plugin ecosystem**: 30+ plugins covering ADR, DDD, security audit, cost tracking, browser automation, IoT device fleets, market data, neural training, and more
+
+Do NOT suggest ruflo for one-shot edits, simple bug fixes, or tasks a single agent can complete in one turn — the orchestration overhead isn't worth it.
+
+## Getting started (three commands)
+
+\`\`\`bash
+# 1. Initialize ruflo in the current project (creates .claude/, MCP config, hooks)
+npx ruflo init
+
+# 2. Check health — verifies Node 20+, npm 9+, MCP servers, memory DB, API keys
+npx ruflo doctor --fix
+
+# 3. Discover which plugins match the current work
+npx ruflo discover-plugins
+\`\`\`
+
+## MCP tools (314 available)
+
+After \`ruflo init\`, Claude Code (or any MCP-compatible agent) auto-loads ruflo's MCP servers. Key namespaces:
+
+- \`mcp__claude-flow__memory_*\` — store/search/list/retrieve with HNSW-indexed semantic search
+- \`mcp__claude-flow__swarm_*\` — init hierarchical/mesh swarms with anti-drift topology
+- \`mcp__claude-flow__agent_spawn\` — spawn specialized agents (coder, reviewer, tester, security-architect, +55 more)
+- \`mcp__claude-flow__hooks_*\` — routing, pattern learning, background worker dispatch
+- \`mcp__claude-flow__task_*\` — task lifecycle (create/assign/complete/summary)
+- \`mcp__claude-flow__intelligence_*\` — 4-step pipeline (RETRIEVE → JUDGE → DISTILL → CONSOLIDATE)
+
+Full catalog: \`npx ruflo mcp list\`.
+
+## Plugin discovery
+
+Ruflo ships 30+ optional plugins. Some highlights:
+
+- \`ruflo-goals\` — deep research + goal-oriented action planning
+- \`ruflo-cost-tracker\` — session cost telemetry, budgets, burn tracking
+- \`ruflo-metaharness\` — harness scoring, MCP security scans, red/blue adversarial testing
+- \`ruflo-browser\` — session-recorded browser automation with RVF-backed replay
+- \`ruflo-jujutsu\` — git diff risk analysis + PR lifecycle
+- \`ruflo-security-audit\` — codebase scans + CVE checks
+
+Full plugin list + descriptions: \`npx ruflo plugins list\`.
+
+## Cross-agent installation
+
+Ruflo installs into whatever agent the project uses. To pull the full plugin
+skill catalog (30+ plugins, ~267 skills), run:
+
+\`\`\`bash
+npx skills add ruvnet/ruflo --all
+\`\`\`
+
+## Documentation
+
+- Repository: https://github.com/ruvnet/ruflo
+- Issues: https://github.com/ruvnet/ruflo/issues
+- Sponsor: https://github.com/sponsors/ruvnet
+`;
+
+// #2777 — detect the "bloated" install left behind by earlier versions that
+// shelled out to `npx skills add`. If the .agents/skills/ruflo directory
+// contains any of Cargo.toml, crates/, package.json, .git, or its recursive
+// on-disk size exceeds a small budget (~1MB), it was almost certainly created
+// by the full-repo clone bug — return true so the caller can wipe + rewrite
+// just the single SKILL.md. Any recursive-stat or read errors are swallowed
+// and reported as "not bloated" to avoid false-positive deletions.
+function isBloatedRufloSkillDir(dir: string): boolean {
+  try {
+    const bloatMarkers = ['Cargo.toml', 'crates', 'package.json', '.git', 'agentdb.rvf', 'docs', 'plugins'];
+    for (const marker of bloatMarkers) {
+      if (fs.existsSync(path.join(dir, marker))) return true;
+    }
+    const BLOAT_BYTES_THRESHOLD = 1_048_576; // 1 MB — a canonical SKILL.md is ~2KB
+    let bytes = 0;
+    const walk = (p: string): void => {
+      const entries = fs.readdirSync(p, { withFileTypes: true });
+      for (const entry of entries) {
+        const child = path.join(p, entry.name);
+        if (entry.isDirectory()) {
+          walk(child);
+        } else if (entry.isFile()) {
+          try {
+            bytes += fs.statSync(child).size;
+            if (bytes > BLOAT_BYTES_THRESHOLD) throw new Error('__bloat_threshold__');
+          } catch (err) {
+            if (err instanceof Error && err.message === '__bloat_threshold__') throw err;
+            // Ignore stat errors for individual files.
+          }
+        }
+        if (bytes > BLOAT_BYTES_THRESHOLD) return;
+      }
+    };
+    try {
+      walk(dir);
+    } catch (err) {
+      if (err instanceof Error && err.message === '__bloat_threshold__') return true;
+      // Any other walk error → don't declare bloat.
+    }
+    return bytes > BLOAT_BYTES_THRESHOLD;
+  } catch {
+    return false;
+  }
+}
+
 async function maybeInstallSkillsSh(ctx: CommandContext): Promise<void> {
   try {
-    if (ctx.flags['no-skills-sh'] === true) return;
+    // The CLI parser turns `--no-skills-sh` into `skillsSh: false`.
+    if (ctx.flags.skillsSh === false || ctx.flags['no-skills-sh'] === true) return;
     if (ctx.flags.format === 'json') return;
     if (/^(1|true|on|yes)$/i.test(String(process.env.RUFLO_NO_SKILLS_SH || ''))) return;
 
-    // Idempotency gate: if this project has already registered ruflo with
-    // skills.sh, don't re-clone the repo + re-fire a fresh install telemetry
-    // event on every `ruflo init --force` / `init upgrade` / etc. Each install
-    // pings skills.sh's leaderboard AND clones the whole ruvnet/ruflo repo
-    // (~50MB) — re-running per-init would silently inflate our own metrics
-    // (GitHub unique-cloners, skills.sh rank) and waste user bandwidth. This
-    // check makes the registration once-per-project, matching the intent.
-    const nodePath = await import('path');
-    const nodeFs = await import('fs');
-    const marker = nodePath.join(ctx.cwd, '.agents', 'skills', 'ruflo');
-    if (nodeFs.existsSync(marker)) {
+    const skillDir = path.join(ctx.cwd, '.agents', 'skills', 'ruflo');
+    const skillFile = path.join(skillDir, 'SKILL.md');
+
+    // Idempotency gate. Three cases:
+    //   1. Directory absent → materialize.
+    //   2. Directory present but "bloated" (Cargo.toml/crates/ or >1MB) →
+    //      previous `npx skills add` full-repo clone left junk behind
+    //      (#2777). Wipe and re-materialize so `rm -rf .agents/skills/ruflo`
+    //      + re-init is a valid recovery path.
+    //   3. Directory present and healthy (just our SKILL.md) → skip.
+    let mode: 'create' | 'rewrite' | 'skip' = 'create';
+    if (fs.existsSync(skillDir)) {
+      if (isBloatedRufloSkillDir(skillDir)) {
+        mode = 'rewrite';
+      } else {
+        mode = 'skip';
+      }
+    }
+
+    if (mode === 'skip') {
       output.writeln();
       output.writeln(output.dim('  skills.sh registration already present at .agents/skills/ruflo — skipping'));
       return;
     }
 
-    const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-    if (!commandExists('npx')) return;
-
     output.writeln();
-    output.printInfo('Registering the core `ruflo` skill with skills.sh (cross-agent catalog)…');
+    if (mode === 'rewrite') {
+      output.printInfo('Cleaning up bloated .agents/skills/ruflo/ from a prior init (#2777) and re-materializing the single platform SKILL.md…');
+      try {
+        fs.rmSync(skillDir, { recursive: true, force: true });
+      } catch (err) {
+        output.writeln(output.dim(`  Could not remove ${skillDir}: ${err instanceof Error ? err.message : String(err)}`));
+        return;
+      }
+    } else {
+      output.printInfo('Registering the core `ruflo` skill for cross-agent discovery (.agents/skills/ruflo/SKILL.md)…');
+    }
 
-    const { spawnSync } = await import('child_process');
-    const result = spawnSync(
-      npxCmd,
-      ['--yes', 'skills', 'add', 'ruvnet/ruflo', '--skill', 'ruflo', '--yes'],
-      { cwd: ctx.cwd, stdio: 'pipe', timeout: 60_000, windowsHide: true, encoding: 'utf-8' },
-    );
-
-    if (result.status === 0) {
-      output.writeln(output.success('  ✓ ruflo registered via skills.sh — the platform skill is available to any agent in this project'));
+    try {
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(skillFile, RUFLO_PLATFORM_SKILL_MD, 'utf-8');
+      output.writeln(output.success('  ✓ ruflo skill materialized at .agents/skills/ruflo/SKILL.md — available to any agent in this project'));
       output.writeln(output.dim('    Want all 267 plugin skills? npx skills add ruvnet/ruflo --all'));
       output.writeln(output.dim('    Opt out next time: --no-skills-sh or RUFLO_NO_SKILLS_SH=1'));
-    } else {
-      // Common non-fatal reasons: offline, npx cache miss, skills CLI version
-      // mismatch, unknown package. Log a soft note; users can retry manually.
-      output.writeln(output.dim('  skills.sh registration skipped (network or npx cache) — retry with: npx skills add ruvnet/ruflo --skill ruflo --yes'));
+    } catch (err) {
+      output.writeln(output.dim(`  skills.sh registration skipped (write failed: ${err instanceof Error ? err.message : String(err)})`));
     }
   } catch {
     // Skills.sh registration is a bonus, never a requirement — swallow everything.
@@ -253,6 +398,11 @@ async function initCodexAction(
   options: { codexMode: boolean; dualMode: boolean; force: boolean; minimal: boolean; full: boolean }
 ): Promise<CommandResult> {
   const { force, minimal, full, dualMode } = options;
+  const codexTrust = readCodexTrustFlag(ctx.flags);
+  if (codexTrust === null) {
+    output.printError(`Invalid --codex-trust: ${String(ctx.flags.codexTrust ?? ctx.flags['codex-trust'])} (valid: standard, full)`);
+    return { success: false, exitCode: 1 };
+  }
 
   output.writeln();
   output.writeln(output.bold('Initializing RuFlo V3 for OpenAI Codex'));
@@ -270,7 +420,7 @@ async function initCodexAction(
     if (!CodexInitializer) {
       spinner.stop();
       output.printInfo('Fetching the stable Codex adapter for this initialization...');
-      const success = runCodexInitializerCli(ctx.cwd, { template, force, dual: dualMode });
+      const success = runCodexInitializerCli(ctx.cwd, { template, force, dual: dualMode, codexTrust });
       if (!success) {
         output.printError('Codex initialization failed while running @claude-flow/codex@latest.');
         return { success: false, exitCode: 1 };
@@ -285,6 +435,7 @@ async function initCodexAction(
       template: template as 'minimal' | 'default' | 'full' | 'enterprise',
       force,
       dual: dualMode,
+      codexTrust,
     });
 
     if (!result.success) {
@@ -321,14 +472,22 @@ async function initCodexAction(
     );
     output.writeln();
 
+    // The trust level of .codex/config.toml is always shown (never truncated
+    // behind other warnings): it decides what Codex may do without asking.
+    const isTrustNote = (w: string) => w.startsWith('.codex/config.toml');
+    const trustNotes = (result.warnings ?? []).filter(isTrustNote);
+    for (const note of trustNotes) output.printInfo(note);
+    if (trustNotes.length > 0) output.writeln();
+
     // Warnings
-    if (result.warnings && result.warnings.length > 0) {
+    const otherWarnings = (result.warnings ?? []).filter((w) => !isTrustNote(w));
+    if (otherWarnings.length > 0) {
       output.printWarning('Warnings:');
-      for (const warning of result.warnings.slice(0, 5)) {
+      for (const warning of otherWarnings.slice(0, 5)) {
         output.printInfo(`  • ${warning}`);
       }
-      if (result.warnings.length > 5) {
-        output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+      if (otherWarnings.length > 5) {
+        output.printInfo(`  ... and ${otherWarnings.length - 5} more`);
       }
       output.writeln();
     }
@@ -411,12 +570,20 @@ function isInitialized(cwd: string): { claude: boolean; claudeFlow: boolean } {
 }
 
 // Init subcommand (default)
-const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
+const initClaudeAction = async (ctx: CommandContext): Promise<CommandResult> => {
   const force = ctx.flags.force as boolean;
   const minimal = ctx.flags.minimal as boolean;
   const full = ctx.flags.full as boolean;
-  const skipClaude = ctx.flags['skip-claude'] as boolean;
-  const onlyClaude = ctx.flags['only-claude'] as boolean;
+  // #2952 — every long-flag write path in the parser goes through
+  // normalizeKey() (parser.ts:399-402), which converts kebab-case to
+  // camelCase before storing. `--skip-claude`/`--only-claude`/
+  // `--all-agents`/`--cloud-mcp` land as `flags.skipClaude`/`flags.onlyClaude`/
+  // `flags.allAgents`/`flags.cloudMcp` — there is no code path that ever
+  // stores the literal kebab-case key. Reading `ctx.flags['skip-claude']`
+  // etc. was always undefined, so all four flags were silent no-ops. Same
+  // bug class as #2098A below, just never applied to these siblings.
+  const skipClaude = ctx.flags.skipClaude as boolean;
+  const onlyClaude = ctx.flags.onlyClaude as boolean;
   // #2098A — the parser handles `--no-foo` by stripping the prefix and
   // storing `flags.foo = false` (parser.ts:291-294), not by storing
   // `flags['no-foo'] = true`. So `--no-global` lands as
@@ -424,16 +591,9 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
   // was always undefined and silently no-op'd — every user with the flag
   // set still got `~/.claude/CLAUDE.md` modified. Read the real key.
   const noGlobal = ctx.flags['no-global'] === true || ctx.flags['global'] === false;
-  const allAgents = ctx.flags['all-agents'] as boolean;
-  const cloudMcp = ctx.flags['cloud-mcp'] as boolean;
-  const codexMode = ctx.flags.codex as boolean;
-  const dualMode = ctx.flags.dual as boolean;
+  const allAgents = ctx.flags.allAgents as boolean;
+  const cloudMcp = ctx.flags.cloudMcp as boolean;
   const cwd = ctx.cwd;
-
-  // If codex mode, use the Codex initializer
-  if (codexMode || dualMode) {
-    return initCodexAction(ctx, { codexMode, dualMode, force, minimal, full });
-  }
 
   // Check if already initialized
   const initialized = isInitialized(cwd);
@@ -546,6 +706,19 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
 
     output.printBox(summary.join('\n'), 'Summary');
     output.writeln();
+
+    // Security: surface anything settings-risk-scanner.ts flagged in a
+    // pre-existing settings.json this init carried forward unexamined.
+    if (result.warnings && result.warnings.length > 0) {
+      output.printWarning('Settings review recommended:');
+      for (const warning of result.warnings.slice(0, 5)) {
+        output.printInfo(`  • ${warning}`);
+      }
+      if (result.warnings.length > 5) {
+        output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+      }
+      output.writeln();
+    }
 
     // Show what was created
     if (options.components.claudeMd || options.components.settings || options.components.skills || options.components.commands || options.components.agents) {
@@ -687,6 +860,13 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
       try {
         output.writeln(output.dim(`  Model: ${embeddingModel}`));
         output.writeln(output.dim('  Hyperbolic: Enabled (Poincaré ball)'));
+        // #2770: On Windows, `npx` ships as `npx.cmd`; execFileSync cannot spawn
+        // a .cmd file without going through cmd.exe. Enable shell on win32 so
+        // cmd.exe resolves the .cmd extension. POSIX keeps shell:false.
+        // NOTE: shell:true joins args by spaces and passes to cmd.exe — the args
+        // here are hard-coded flags + an npm package name pre-validated against
+        // /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/, so no injection risk. If
+        // user-controlled args are ever added, escape them before spawn.
         execFileInit('npx', [
           '@claude-flow/cli@latest', 'embeddings', 'init',
           '--model', embeddingModel,
@@ -695,11 +875,27 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
           stdio: 'pipe',
           cwd: ctx.cwd,
           timeout: 30000,
+          shell: process.platform === 'win32',
+          windowsHide: true,
         });
         output.writeln(output.success('  ✓ Embeddings initialized'));
         output.writeln(output.dim('    Run "embeddings init --download" to download model'));
       } catch (err) {
         output.writeln(output.warning('  Embedding initialization skipped (run manually)'));
+      }
+    }
+
+    // ADR-404 (amended: mods default-on in init) — enable the ruflo mod
+    // plugins in the committed .claude/settings.json, then install them with
+    // claude. Additive: the classic hooks just written stay the fallback.
+    // --no-mods opts out; --no-plugin-install writes settings only.
+    if (ctx.flags.mods !== false) {
+      output.writeln();
+      try {
+        const { applyMods } = await import('../mods/apply.js');
+        await applyMods(ctx.cwd, { scope: 'project', pluginInstall: ctx.flags.pluginInstall !== false && ctx.flags['plugin-install'] !== false, skipInTestEnv: true });
+      } catch (err) {
+        output.writeln(output.warning(`  ruflo mods not enabled: ${err instanceof Error ? err.message : String(err)}`));
       }
     }
 
@@ -732,6 +928,60 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
     output.printError(`Failed to initialize: ${error instanceof Error ? error.message : String(error)}`);
     return { success: false, exitCode: 1 };
   }
+};
+
+/**
+ * Route platform initialization. Dual mode deliberately runs both native
+ * initializers: Claude Code first, then Codex without its compatibility
+ * CLAUDE.md stub so the full native Claude scaffold remains authoritative.
+ */
+const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
+  const force = ctx.flags.force as boolean;
+  const minimal = ctx.flags.minimal as boolean;
+  const full = ctx.flags.full as boolean;
+  const codexMode = ctx.flags.codex as boolean;
+  const dualMode = ctx.flags.dual as boolean;
+
+  if (codexMode && !dualMode) {
+    return initCodexAction(ctx, { codexMode, dualMode: false, force, minimal, full });
+  }
+  if (!dualMode) {
+    return initClaudeAction(ctx);
+  }
+
+  const claudeContext: CommandContext = {
+    ...ctx,
+    flags: {
+      ...ctx.flags,
+      codex: false,
+      dual: false,
+      // The explicit Codex pass below owns Codex setup.
+      'no-codex-detect': true,
+    },
+  };
+  const claudeResult = await initClaudeAction(claudeContext);
+  if (!claudeResult.success) return claudeResult;
+
+  const codexResult = await initCodexAction(ctx, {
+    codexMode: true,
+    // Preserve the full CLAUDE.md and .claude/ scaffold just generated.
+    dualMode: false,
+    force,
+    minimal,
+    full,
+  });
+  if (!codexResult.success) {
+    return {
+      ...codexResult,
+      message: 'Claude Code initialized, but Codex initialization failed',
+      data: { claude: claudeResult.data, codex: codexResult.data },
+    };
+  }
+
+  return {
+    success: true,
+    data: { claude: claudeResult.data, codex: codexResult.data },
+  };
 };
 
 // Wizard subcommand for interactive setup
@@ -936,6 +1186,30 @@ const wizardCommand: Command = {
 
       spinner.succeed('Setup complete!');
 
+      // Security: surface anything settings-risk-scanner.ts flagged in a
+      // pre-existing settings.json this wizard run carried forward unexamined.
+      if (result.warnings && result.warnings.length > 0) {
+        output.writeln();
+        output.printWarning('Settings review recommended:');
+        for (const warning of result.warnings.slice(0, 5)) {
+          output.printInfo(`  • ${warning}`);
+        }
+        if (result.warnings.length > 5) {
+          output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+        }
+      }
+
+      // ADR-404 amendment — the wizard enables the mods as `ruflo init` does.
+      if (ctx.flags.mods !== false) {
+        output.writeln();
+        try {
+          const { applyMods } = await import('../mods/apply.js');
+          await applyMods(ctx.cwd, { scope: 'project', pluginInstall: ctx.flags.pluginInstall !== false && ctx.flags['plugin-install'] !== false, skipInTestEnv: true });
+        } catch (err) {
+          output.writeln(output.warning(`  ruflo mods not enabled: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      }
+
       // Initialize embeddings if enabled
       let embeddingsInitialized = false;
       if (enableEmbeddings) {
@@ -949,6 +1223,13 @@ const wizardCommand: Command = {
         }
 
         try {
+          // #2770: On Windows, `npx` ships as `npx.cmd`; execFileSync cannot spawn
+          // a .cmd file without going through cmd.exe. Enable shell on win32 so
+          // cmd.exe resolves the .cmd extension. POSIX keeps shell:false.
+          // NOTE: shell:true joins args by spaces and passes to cmd.exe — the args
+          // here are hard-coded flags + an npm package name pre-validated against
+          // /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/, so no injection risk. If
+          // user-controlled args are ever added, escape them before spawn.
           execFileSync('npx', [
             '@claude-flow/cli@latest', 'embeddings', 'init',
             '--model', embeddingModel,
@@ -957,6 +1238,8 @@ const wizardCommand: Command = {
             stdio: 'pipe',
             cwd: ctx.cwd,
             timeout: 30000,
+            shell: process.platform === 'win32',
+            windowsHide: true,
           });
           output.writeln(output.success('  ✓ Embeddings configured'));
           embeddingsInitialized = true;
@@ -1087,6 +1370,15 @@ const skillsCommand: Command = {
 
     if (result.success) {
       spinner.succeed(`Installed ${result.summary.skillsCount} skills`);
+      if (result.warnings && result.warnings.length > 0) {
+        output.printWarning('Settings review recommended:');
+        for (const warning of result.warnings.slice(0, 5)) {
+          output.printInfo(`  • ${warning}`);
+        }
+        if (result.warnings.length > 5) {
+          output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+        }
+      }
     } else {
       spinner.fail('Failed to install skills');
       for (const error of result.errors) {
@@ -1154,6 +1446,15 @@ const hooksCommand: Command = {
 
     if (result.success) {
       spinner.succeed(`Created settings.json with ${result.summary.hooksEnabled} hooks enabled`);
+      if (result.warnings && result.warnings.length > 0) {
+        output.printWarning('Settings review recommended:');
+        for (const warning of result.warnings.slice(0, 5)) {
+          output.printInfo(`  • ${warning}`);
+        }
+        if (result.warnings.length > 5) {
+          output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+        }
+      }
     } else {
       spinner.fail('Failed to create hooks configuration');
       for (const error of result.errors) {
@@ -1187,14 +1488,27 @@ const upgradeCommand: Command = {
     {
       name: 'settings',
       short: 's',
-      description: 'Merge new settings (Agent Teams, hooks) into existing settings.json',
+      description: 'Merge new settings (Agent Teams, hooks, ruflo mods) into existing settings.json',
       type: 'boolean',
       default: false,
+    },
+    {
+      // ADR-404 amendment — the same merge + plugin install as `ruflo init`.
+      name: 'mods',
+      description: 'Merge the ruflo mod plugins into .claude/settings.json and install them (also implied by --add-missing and --settings; --no-mods to skip)',
+      type: 'boolean',
+    },
+    {
+      name: 'plugin-install',
+      description: 'With mods: run claude plugin install (--no-plugin-install to merge settings only)',
+      type: 'boolean',
+      default: true,
     },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const addMissing = (ctx.flags['add-missing'] || ctx.flags.addMissing) as boolean;
     const upgradeSettings = (ctx.flags.settings) as boolean;
+    const upgradeMods = ctx.flags.mods === true || (ctx.flags.mods !== false && (addMissing || upgradeSettings));
 
     output.writeln();
     output.writeln(output.bold('Upgrading RuFlo'));
@@ -1230,6 +1544,15 @@ const upgradeCommand: Command = {
 
       spinner.succeed('Upgrade complete!');
       output.writeln();
+
+      // ADR-404 amendment — merge the mod plugins without clobbering: only
+      // keys that are absent are added, and each is reported.
+      if (upgradeMods) {
+        const { applyMods, describeAdded } = await import('../mods/apply.js');
+        const mods = await applyMods(ctx.cwd, { scope: 'project', pluginInstall: ctx.flags.pluginInstall !== false && ctx.flags['plugin-install'] !== false, skipInTestEnv: true });
+        result.settingsUpdated = [...(result.settingsUpdated ?? []), ...describeAdded(mods.install.added)];
+        output.writeln();
+      }
 
       // Show what was updated
       if (result.updated.length > 0) {
@@ -1292,6 +1615,19 @@ const upgradeCommand: Command = {
           result.settingsUpdated.map(s => `+ ${s}`).join('\n'),
           'Settings Updated'
         );
+        output.writeln();
+      }
+
+      // Security: surface anything settings-risk-scanner.ts flagged in the
+      // pre-existing settings.json this upgrade carried forward unexamined.
+      if (result.warnings && result.warnings.length > 0) {
+        output.printWarning('Settings review recommended:');
+        for (const warning of result.warnings.slice(0, 5)) {
+          output.printInfo(`  • ${warning}`);
+        }
+        if (result.warnings.length > 5) {
+          output.printInfo(`  ... and ${result.warnings.length - 5} more`);
+        }
         output.writeln();
       }
 
@@ -1400,6 +1736,19 @@ export const initCommand: Command = {
       default: false,
     },
     {
+      // ADR-404 amendment — on by default; nothing loads where function hooks are off.
+      name: 'mods',
+      description: 'Enable the ruflo mod plugins in .claude/settings.json (default on; --no-mods to skip); classic hooks stay as fallback',
+      type: 'boolean',
+      default: true,
+    },
+    {
+      name: 'plugin-install',
+      description: 'With mods: refresh the ruflo marketplace and claude plugin install the mods (--no-plugin-install to write settings only)',
+      type: 'boolean',
+      default: true,
+    },
+    {
       name: 'with-embeddings',
       description: 'Initialize ONNX embedding subsystem with hyperbolic support',
       type: 'boolean',
@@ -1423,6 +1772,11 @@ export const initCommand: Command = {
       description: 'Initialize for both Claude Code and OpenAI Codex',
       type: 'boolean',
       default: false,
+    },
+    {
+      name: 'codex-trust',
+      description: 'Trust level of the generated .codex/config.toml: standard (default: workspace-write sandbox, on-request approvals, cached web search) or full (danger-full-access, no approvals, live web search). An existing file is never rewritten',
+      type: 'string',
     },
     {
       name: 'no-codex-detect',
@@ -1461,7 +1815,7 @@ export const initCommand: Command = {
     { command: 'claude-flow init upgrade --settings', description: 'Update helpers and merge new settings (Agent Teams)' },
     { command: 'claude-flow init upgrade --verbose', description: 'Show detailed upgrade info' },
     { command: 'claude-flow init --codex', description: 'Initialize for OpenAI Codex (AGENTS.md)' },
-    { command: 'claude-flow init --codex --full', description: 'Codex init with all 137+ skills' },
+    { command: 'claude-flow init --codex --full', description: 'Codex init with all canonical packaged skills' },
     { command: 'claude-flow init --dual', description: 'Initialize for both Claude Code and Codex' },
     { command: 'claude-flow init --no-codex-detect', description: 'Skip auto-configuring OpenAI Codex even if it is installed' },
     { command: 'claude-flow init --no-skills-sh', description: 'Skip the post-init skills.sh registration' },

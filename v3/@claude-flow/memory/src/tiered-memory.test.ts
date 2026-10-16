@@ -6,7 +6,11 @@
  * entries without temporal fields.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { TieredMemoryStore, isTemporallyValid } from './tiered-memory.js';
 
 describe('TieredMemoryStore — legacy behavior (backward compatibility)', () => {
@@ -184,5 +188,128 @@ describe('isTemporallyValid', () => {
     expect(isTemporallyValid({ validUntil: '2026-07-03T13:00:00Z' }, now)).toBe(true);
     // validUntil exactly now → expired (window is half-open)
     expect(isTemporallyValid({ validUntil: '2026-07-03T12:00:00Z' }, now)).toBe(false);
+  });
+});
+
+describe('TieredMemoryStore — durability (#2887)', () => {
+  const dbs: Database.Database[] = [];
+  const dirs: string[] = [];
+
+  function freshDbPath(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tiered-durability-'));
+    dirs.push(dir);
+    return path.join(dir, 'agentdb-memory.db');
+  }
+
+  function open(dbPath: string): Database.Database {
+    const db = new Database(dbPath);
+    dbs.push(db);
+    return db;
+  }
+
+  afterEach(() => {
+    for (const db of dbs.splice(0)) { try { db.close(); } catch { /* already closed */ } }
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a successful store is queryable on disk, not just in the maps', () => {
+    const dbPath = freshDbPath();
+    const store = new TieredMemoryStore({ db: open(dbPath) });
+
+    const result = store.store('durable-key', 'DURABLE_VALUE', 'semantic');
+
+    expect(result.durable).toBe(true);
+    expect(result.persistence).toBe('sqlite');
+
+    // Read through an INDEPENDENT connection — proves the row is committed,
+    // not merely sitting in the writer's in-memory maps.
+    const rows = open(dbPath)
+      .prepare('SELECT key, value, tier FROM tiered_memory WHERE key = ?')
+      .all('durable-key');
+    expect(rows).toEqual([{ key: 'durable-key', value: 'DURABLE_VALUE', tier: 'semantic' }]);
+  });
+
+  it('rehydrates persisted entries into a brand-new store instance', () => {
+    const dbPath = freshDbPath();
+    new TieredMemoryStore({ db: open(dbPath) }).store('survives', 'ACROSS_INSTANCES', 'working');
+
+    const reopened = new TieredMemoryStore({ db: open(dbPath) });
+
+    expect(reopened.recall('ACROSS_INSTANCES')).toHaveLength(1);
+    expect(reopened.countPersisted()).toBe(1);
+  });
+
+  it('reports durable:false — never a bare success — when there is no backing db', () => {
+    const store = new TieredMemoryStore();
+
+    const result = store.store('volatile-key', 'LOST_ON_EXIT');
+
+    expect(store.isDurable()).toBe(false);
+    expect(result.durable).toBe(false);
+    expect(result.persistence).toBe('volatile');
+    // No table exists to count, so health checks can't be told a row landed.
+    expect(store.countPersisted()).toBeNull();
+  });
+
+  it('superseded entries stay auditable on disk, and removal deletes the row', () => {
+    const dbPath = freshDbPath();
+    const store = new TieredMemoryStore({ db: open(dbPath) });
+    const first = store.store('fact', 'v1', 'semantic');
+    store.store('fact', 'v2', 'semantic', { supersedes: first.id });
+
+    expect(store.countPersisted()).toBe(2);
+    expect(store.recall('fact', 5, { includeExpired: true })).toHaveLength(2);
+
+    expect(store.remove('fact')).toBe(true);
+    expect(
+      open(dbPath).prepare('SELECT COUNT(*) AS n FROM tiered_memory WHERE archived = 0').get(),
+    ).toEqual({ n: 0 });
+  });
+});
+
+describe('TieredMemoryStore — multi-word recall (#4152)', () => {
+  const LESSON = "#1851: parseInt(pair, 16) tolerates trailing garbage ('1z' -> 1); validate the whole hex body before decoding";
+  let store: TieredMemoryStore;
+  beforeEach(() => {
+    store = new TieredMemoryStore();
+    store.store('lesson-1851', LESSON, 'semantic');
+    store.store('unrelated', 'Concrete slabs must cure for 7 days before heavy loads', 'semantic');
+  });
+
+  it('three words taken from the stored value find it (they used to return [])', () => {
+    expect(store.recall('parseInt trailing garbage').map(e => e.key)).toEqual(['lesson-1851']);
+  });
+
+  it('a natural-language question about the lesson finds it', () => {
+    const hit = store.recall('why did malformed hex like 1z decode instead of failing');
+    expect(hit.map(e => e.key)).toContain('lesson-1851');
+    expect(hit.map(e => e.key)).not.toContain('unrelated');
+  });
+
+  it('single words and exact phrases still work and rank first', () => {
+    expect(store.recall('hex').map(e => e.key)).toEqual(['lesson-1851']);
+    expect(store.recall('validate the whole hex body').map(e => e.key)[0]).toBe('lesson-1851');
+  });
+
+  it('a query that shares only one incidental word with an entry does not match', () => {
+    expect(store.recall('how long before heavy rain arrives tomorrow').map(e => e.key)).toEqual([]);
+  });
+
+  it('ranks the better term coverage first, then the newest', () => {
+    const s = new TieredMemoryStore();
+    s.store('a', 'trailing garbage in hex input', 'working');
+    s.store('b', 'trailing garbage', 'working');
+    s.store('c', 'garbage only here', 'working');
+    expect(s.recall('hex trailing garbage').map(e => e.key)[0]).toBe('a');
+  });
+
+  it('stop words alone match nothing', () => {
+    expect(store.recall('what is the').map(e => e.key)).toEqual([]);
+  });
+
+  it('respects topK and validity windows as before', () => {
+    const s = new TieredMemoryStore();
+    for (let i = 0; i < 8; i++) s.store(`k${i}`, `parse trailing garbage ${i}`, 'working');
+    expect(s.recall('parse trailing garbage', 3)).toHaveLength(3);
   });
 });

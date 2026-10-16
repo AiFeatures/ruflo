@@ -34,6 +34,30 @@ import { dirname, join } from 'path';
 const _origWarn = console.warn;
 const _origLog = console.log;
 const _origError = console.error;
+
+// #2726 — Some MCP clients place every advertised schema in every model
+// request. Keep "all" as the backwards-compatible default, but honor the
+// same category/namespace/exact-name selector as `mcp start --tools`.
+function _filterAdvertisedMcpTools(tools) {
+  const argv = process.argv.slice(2);
+  const toolsIndex = argv.findIndex((arg) => arg === '--tools');
+  const inlineTools = argv.find((arg) => arg.startsWith('--tools='));
+  const configured = process.env.CLAUDE_FLOW_MCP_TOOLS
+    || (toolsIndex >= 0 ? argv[toolsIndex + 1] : undefined)
+    || (inlineTools ? inlineTools.slice('--tools='.length) : undefined);
+  if (!configured || configured.trim().toLowerCase() === 'all') return tools;
+  const selectors = new Set(
+    configured.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean),
+  );
+  if (selectors.size === 0) return tools;
+  return tools.filter((tool) => {
+    const name = tool.name.toLowerCase();
+    const category = typeof tool.category === 'string' ? tool.category.toLowerCase() : '';
+    return selectors.has(name)
+      || selectors.has(category)
+      || Array.from(selectors).some((selector) => name.startsWith(`${selector}_`));
+  });
+}
 const _isCosmeticAgentdbPatchNoise = (msg) =>
   msg.includes('[AgentDB Patch]') && msg.includes('Controller index not found');
 const _STDERR_REDIRECT_PREFIXES = [
@@ -140,6 +164,8 @@ const isMCPMode = !process.stdin.isTTY
 if (isMCPMode) {
   // Run MCP server mode
   const { listMCPTools, callMCPTool, hasTool } = await import('../dist/src/mcp-client.js');
+  const { isPolicyEnforcementEnabled, loadMcpPolicy, evaluateToolCall } =
+    await import('../dist/src/mcp-tools/policy-enforcer.js');
 
   const VERSION = '3.0.0';
   const sessionId = `mcp-${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -231,13 +257,13 @@ if (isMCPMode) {
             serverInfo: { name: 'ruflo', version: VERSION },
             capabilities: {
               tools: { listChanged: true },
-              resources: { subscribe: true, listChanged: true },
+              resources: {},
             },
           },
         };
 
       case 'tools/list': {
-        const tools = listMCPTools();
+        const tools = _filterAdvertisedMcpTools(listMCPTools());
         return {
           jsonrpc: '2.0',
           id: message.id,
@@ -263,12 +289,26 @@ if (isMCPMode) {
           };
         }
 
+        if (isPolicyEnforcementEnabled()) {
+          const check = evaluateToolCall(loadMcpPolicy(), sessionId, toolName);
+          if (!check.allowed) {
+            return {
+              jsonrpc: '2.0',
+              id: message.id,
+              error: { code: -32001, message: `Policy denied: ${check.reason}` },
+            };
+          }
+        }
+
         try {
-          const result = await callMCPTool(toolName, toolParams, { sessionId });
+          const result = await callMCPTool(toolName, toolParams, { sessionId, transport: 'stdio' });
+          // Failed task outcomes are data; an explicit handler error is a tool failure.
+          const isError = result !== null && typeof result === 'object'
+            && typeof result.error === 'string' && result.error.trim().length > 0;
           return {
             jsonrpc: '2.0',
             id: message.id,
-            result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
+            result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError },
           };
         } catch (error) {
           return {
@@ -281,6 +321,16 @@ if (isMCPMode) {
           };
         }
       }
+
+      // A declared capability must be served (ADR-490): no resources are exposed, so list answers are empty and a read is "not found".
+      case 'resources/list':
+        return { jsonrpc: '2.0', id: message.id, result: { resources: [] } };
+
+      case 'resources/templates/list':
+        return { jsonrpc: '2.0', id: message.id, result: { resourceTemplates: [] } };
+
+      case 'resources/read':
+        return { jsonrpc: '2.0', id: message.id, error: { code: -32002, message: 'Resource not found' } };
 
       case 'notifications/initialized':
         return null;

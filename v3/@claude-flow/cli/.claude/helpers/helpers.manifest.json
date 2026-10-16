@@ -1,13 +1,14 @@
 {
   "manifest": {
-    "version": "3.32.9",
+    "version": "3.56.9",
     "files": {
-      "auto-memory-hook.mjs": "e3e1033b24704992ddef6b31c7fa9dd7fcd9e1af7935dd77ef73402b916b31e6",
-      "hook-handler.cjs": "f87ec28684bfc5fd0a54c46bd2a53a3fb037defe71d0ea4b8a5cb88a2cd87a3f",
-      "intelligence.cjs": "5a55d979cb7ba5c8c4f27f3b2e6d686fbb1045d180023b803da672a37e05b915",
-      "statusline.cjs": "10f74a1aa9af217d0623c0a9839d82825b0eed31a4707a7531a85c6116869a6c"
+      "auto-memory-hook.mjs": "631fac9d518835e2852a406888316bbbddddb49e7ed8e406d2e971f46833df9a",
+      "hook-handler.cjs": "bc12b3cae92d5a7c8deef699fa00d0ef07b57625c18dbeac4387f15725b8e09f",
+      "intelligence.cjs": "a95ac9ee2759c340b14f9ff656765bcb05e0cefe2f018116bd26b3ba9987f3e4",
+      "statusline.cjs": "d72417ecb38634011a19f095a30e07b9929e6f97663520172ece9be7491b2eaa",
+      "router.cjs": "16648b3c0d73b6681ac2d8d13def6a68286c57f5a11004de5b19a0fa088c833d"
     }
   },
-  "signature": "E590NNJFlbDXn0+xPDQqtCOX2KXTXY/DeEBidDqT7oRttLqpS0EBEBU5+WnU0tWutho7uVcUDW2548Job9pRAw==",
+  "signature": "RPzley7vLcJj6HpvMcrbBF9uUmHf4pKKwZ0AhwjjIa8a7CsGMx9MP7lEClzioTp3Lp7/ZcC8hFkmHflCnR0sCA==",
   "algorithm": "ed25519"
 }

@@ -6,13 +6,21 @@
 // Pure functions only — no memory_store / subprocess calls live here. Callers
 // own persistence.
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 // #2474 bonus: `.claude/worktrees/*` mirrors the repo so every ADR was
 // indexed 2-3x. Skip the whole `.claude` tree — it's all ruflo runtime
 // state (worktrees, scheduled tasks, etc.), never authored content.
-export const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'v2', '.next', '.turbo', 'build', '.claude']);
+//
+// #2911: `.brain` is ruvnet-brain's own tree, holding shallow clones of
+// ~50 external repos under `.brain/repo/clones/` — many carrying their
+// own `docs/adr/`. Left unskipped, a walk from the project root picks up
+// every foreign ADR (measured: 1,415 foreign vs 19 belonging to the
+// project) and, because `.brain` sorts before `docs`, the project's own
+// ADRs land dead last in the walk order — an interrupted run can index
+// hundreds of foreign ADRs and zero of the project's.
+export const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'v2', '.next', '.turbo', 'build', '.claude', '.brain']);
 
 // #2474 Bug 4: parseId padded ADR numbers, but extractAdrRefs's
 // padStart-then-strip pipeline produced different results for the same
@@ -28,7 +36,14 @@ export function normalizeAdrId(raw) {
   return digits.length >= 4 ? `ADR-${digits}` : `ADR-${digits.padStart(3, '0')}`;
 }
 
-export function findAdrs(dir, out = []) {
+// #4126: an index table (README.md, index.md) or a template (template*.md) in docs/adr is not an ADR.
+const NON_ADR_FILE = /^(?:readme|index|template[^/]*)\.md$/i;
+
+export function findAdrs(dir, out = [], visited = new Set()) {
+  let canonical;
+  try { canonical = realpathSync(dir); } catch { return out; }
+  if (visited.has(canonical)) return out;
+  visited.add(canonical);
   let entries;
   try { entries = readdirSync(dir); } catch { return out; }
   for (const e of entries) {
@@ -37,8 +52,8 @@ export function findAdrs(dir, out = []) {
     let st;
     try { st = statSync(p); } catch { continue; }
     if (st.isDirectory()) {
-      findAdrs(p, out);
-    } else if (e.endsWith('.md') && (p.includes('/docs/adr/') || p.includes('/docs/adrs/'))) {
+      findAdrs(p, out, visited);
+    } else if (e.endsWith('.md') && !NON_ADR_FILE.test(e) && (p.includes('/docs/adr/') || p.includes('/docs/adrs/'))) {
       out.push(p);
     }
   }
@@ -90,11 +105,21 @@ function parseStatus(text) {
   // `**Status**:` (colon outside) and dropped every Nygard-style ADR
   // to status=Unknown. Now the colon can sit on either side of the `**`.
   // Strip parenthetical qualifiers like "Proposed (v3.6.x)" -> "Proposed".
-  let m = /^\*\*Status:?\*\*:?\s*([A-Za-z][A-Za-z\- ]*?)(?:\s*\(.*?\))?\s*$/m.exec(text);
+  //
+  // #2781 (Jordi-Izquierdo-DDS): tolerate an optional Markdown list-item
+  // prefix (`- **Status**: proposed`) — that's exactly what adr-create's
+  // own template emits, and the column-0-anchored regex dropped every
+  // freshly-scaffolded ADR to status=Unknown, making adr-review a no-op.
+  let m = /^[-*+]?\s*\*\*Status:?\*\*:?\s*([A-Za-z][A-Za-z\- ]*?)(?:\s*\(.*?\))?\s*$/m.exec(text);
   if (m) return m[1].trim();
   // Also handle full-bold MADR style: **Status: Value** (entire phrase bolded)
-  m = /^\*\*Status:\s*([A-Za-z][A-Za-z\- ]*?)(?:\s*\([^)]*\))?\*\*\s*$/m.exec(text);
-  return m ? m[1].trim() : 'Unknown';
+  m = /^[-*+]?\s*\*\*Status:\s*([A-Za-z][A-Za-z\- ]*?)(?:\s*\([^)]*\))?\*\*\s*$/m.exec(text);
+  if (m) return m[1].trim();
+  // #4126: real status lines carry more than one parenthetical: a link ("superseded by
+  // [ADR-025](...) (2026-07-02)"), a date plus a note ("accepted (2026-07-02) — spike
+  // closed"), an amendment marker. The leading keyword is the status; ignore the rest.
+  m = /^[-*+]?\s*\*\*Status:?\*\*:?[ \t]*\**[ \t]*([A-Za-z][A-Za-z-]*)\b/m.exec(text);
+  return m ? m[1] : 'Unknown';
 }
 
 function parseDate(text) {
@@ -103,7 +128,9 @@ function parseDate(text) {
     const m = /^date:\s*(\S+)/m.exec(fm[1]);
     if (m) return m[1];
   }
-  const m = /^\*\*Date\*\*:\s*(\S+)/m.exec(text);
+  // #2659: adr-create emits metadata as Markdown list items. Accept the
+  // optional list marker and both common colon placements, matching Status.
+  const m = /^[-*+]?\s*\*\*Date:?\*\*:?\s*(\S+)/m.exec(text);
   return m ? m[1] : '';
 }
 
@@ -113,12 +140,12 @@ function parseTags(text) {
     const m = /^tags:\s*\[([^\]]+)\]/m.exec(fm[1]);
     if (m) return m[1].split(',').map((s) => s.trim()).filter(Boolean);
   }
-  const m = /^\*\*Tags\*\*:\s*(.+)$/m.exec(text);
+  const m = /^[-*+]?\s*\*\*Tags:?\*\*:?\s*(.+)$/m.exec(text);
   return m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : [];
 }
 
 function parseContextFirstParagraph(text) {
-  const m = /^##\s*Context\s*$\s*([\s\S]+?)(?=^##\s|\Z)/m.exec(text);
+  const m = /^##\s*Context\s*$\s*([\s\S]+?)(?=^##\s|(?![\s\S]))/m.exec(text);
   if (!m) return '';
   return m[1].trim().split(/\n\s*\n/)[0].replace(/\s+/g, ' ').slice(0, 400);
 }
@@ -148,19 +175,35 @@ function parseLinks(text, selfId) {
       }
     }
   }
-  // Body relationship lines. #2474 Bug 3: loosened to accept both colon
-  // placements (`**Supersedes:**` and `**Supersedes**:`) and an optional
-  // parenthetical qualifier like `**Supersedes (partial):**` — same
-  // tolerance as parseStatus.
-  const REL = (label) => new RegExp(`^\\*\\*${label}(?:\\s*\\([^)]*\\))?:?\\*\\*:?\\s*(.+)$`, 'mi');
-  const supersedes = REL('Supersedes').exec(text);
-  if (supersedes) for (const ref of extractAdrRefs(supersedes[1])) out.push({ from: ref, to: selfId, relation: 'supersedes' });
-  const amended = REL('(?:Amended[ -]by|Amends)').exec(text);
-  if (amended) for (const ref of extractAdrRefs(amended[1])) out.push({ from: selfId, to: ref, relation: 'amends' });
-  const related = REL('Related').exec(text);
-  if (related) for (const ref of extractAdrRefs(related[1])) out.push({ from: selfId, to: ref, relation: 'related' });
-  const dependsOn = REL('Depends[ -]on').exec(text);
-  if (dependsOn) for (const ref of extractAdrRefs(dependsOn[1])) out.push({ from: selfId, to: ref, relation: 'depends-on' });
+  // Accept qualified labels, either colon placement, and repeated fields.
+  // Wrapped reference lists (#2781) remain supported, but narrative prose is
+  // not a continuation: incidental ADR mentions must not invent edges (#3096).
+  const values = (label) => {
+    const re = new RegExp(
+      `^[ \\t]*(?:[-*+]\\s+)?\\*\\*${label}(?=\\s|:|\\*\\*|/|\\()[^*\\r\\n]*\\*\\*:?[^\\S\\r\\n]*(.*)$`, 'gmi',
+    );
+    return [...text.matchAll(re)].map((match) => {
+      let value = match[1];
+      const rest = text.slice(match.index + match[0].length).split(/\r?\n/).slice(1);
+      for (const line of rest) {
+        const plain = line.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+        if (!/\bADR-?\d+\b/i.test(plain) || !/^[\s,+;&]*$/.test(plain.replace(/\bADR-?\d+\b/gi, ''))) break;
+        value += `\n${line}`;
+      }
+      return value;
+    });
+  };
+  for (const value of values('Supersedes')) for (const ref of extractAdrRefs(value)) out.push({ from: ref, to: selfId, relation: 'supersedes' });
+  for (const value of values('(?:Amended[ -]by|Amends)')) for (const ref of extractAdrRefs(value)) out.push({ from: selfId, to: ref, relation: 'amends' });
+  for (const value of values('(?:Related|Relates)')) for (const ref of extractAdrRefs(value)) out.push({ from: selfId, to: ref, relation: 'related' });
+  for (const value of values('Depends[ -]on')) for (const ref of extractAdrRefs(value)) out.push({ from: selfId, to: ref, relation: 'depends-on' });
+  // #4126: "Status: superseded by ADR-025" names the superseding ADR; the edge runs
+  // old -> new, the same direction a "Supersedes:" line in the newer ADR produces.
+  const sb = /^[-*+]?\s*\*\*Status:?\*\*:?[ \t]*\**[ \t]*superseded[ \t]+by\b(.*)$/im.exec(text);
+  if (sb) {
+    const [ref] = extractAdrRefs(sb[1].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1'));
+    if (ref && ref !== selfId) out.push({ from: selfId, to: ref, relation: 'supersedes' });
+  }
   return out;
 }
 

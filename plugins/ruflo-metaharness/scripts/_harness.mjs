@@ -26,7 +26,8 @@
 //      arbitrary code on user machines on the very next skill invocation.
 //      The version is now PINNED to METAHARNESS_PIN_VERSION (tilde range —
 //      patch updates only) and only bumped deliberately, in lock-step with
-//      optionalDependencies in @claude-flow/cli + ruflo package.json.
+//      the range declared in @claude-flow/cli/package.json (enforced by
+//      scripts/check-metaharness-pins.mjs).
 //   2. PERF: @latest forced an npm-registry metadata check on EVERY call.
 //      Resolution is now (a) an already-installed local metaharness
 //      satisfying the pin (walk-up node_modules — free), then (b) a ONE-TIME
@@ -53,10 +54,15 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
-// Pinned semver range. Bump in lock-step with optionalDependencies in
-// @claude-flow/cli/package.json + ruflo/package.json. NEVER @latest.
+// Pinned semver range. NEVER @latest. Must cover the `metaharness` range
+// declared in v3/@claude-flow/cli/package.json (optional peer `^0.4.1`):
+// this constant decides which INSTALLED copy findLocalPackageDir() accepts,
+// so a range that misses the declared one rejects the copy ruflo ships and
+// npm-installs another at tool-call time. It sat at ~0.3.0 after the CLI
+// moved to ^0.4.1 (b8ec03f34) because nothing compared the two;
+// scripts/check-metaharness-pins.mjs now fails when they diverge.
 const METAHARNESS_PKG = 'metaharness';
-const METAHARNESS_PIN_VERSION = '~0.3.0';
+const METAHARNESS_PIN_VERSION = '~0.4.1';
 
 const REASON_NOT_AVAILABLE = 'metaharness-not-available';
 
@@ -279,6 +285,7 @@ export function rankSeverity(s) {
  *     harness mcp-scan — <path>
  *
  *       [INFO] No MCP security issues found
+ *       [LOW ] Padded severity labels are also emitted by newer releases
  *              Policy is default-deny with safe capability grants and an audit log.
  *
  *     Result: INFO (1 finding, 0 high)
@@ -293,7 +300,10 @@ export function parseMcpScanText(stdout) {
   const lines = (stdout || '').split('\n');
   let current = null;
   for (const line of lines) {
-    const m = /^\s*\[([A-Z]+)\]\s+(.+?)\s*$/.exec(line);
+    // metaharness <=0.3.0 emitted `[LOW]`; newer releases pad labels to a
+    // fixed-width column (`[LOW ]`). Accept optional whitespace before the
+    // closing bracket so both installed versions remain compatible.
+    const m = /^\s*\[([A-Z]+)\s*\]\s+(.+?)\s*$/.exec(line);
     if (m) {
       if (current) findings.push(current);
       current = { severity: m[1].toLowerCase(), message: m[2] };

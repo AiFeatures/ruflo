@@ -24,6 +24,8 @@ import { analyzeTools } from './mcp-tools/analyze-tools.js';
 import { progressTools } from './mcp-tools/progress-tools.js';
 import { embeddingsTools } from './mcp-tools/embeddings-tools.js';
 import { claimsTools } from './mcp-tools/claims-tools.js';
+import { policyTools } from './mcp-tools/policy-tools.js';
+import { authorizeMcpTool, classifyMcpTool } from './services/policy-runtime.js';
 import { securityTools } from './mcp-tools/security-tools.js';
 import { transferTools } from './mcp-tools/transfer-tools.js';
 // V2 Compatibility tools
@@ -50,7 +52,10 @@ import { wasmAgentTools } from './mcp-tools/wasm-agent-tools.js';
 // the local WASM-sandboxed `wasm_agent_*` (rvagent) tools. Lives in the
 // `ruflo-agent` plugin.
 import { managedAgentTools } from './mcp-tools/managed-agent-tools.js';
-import { guidanceTools } from './mcp-tools/guidance-tools.js';
+import {
+  configureGuidanceToolProvider,
+  guidanceTools,
+} from './mcp-tools/guidance-tools.js';
 import { autopilotTools } from './mcp-tools/autopilot-tools.js';
 // ADR-150 — MetaHarness MCP tools (score / genome / mcp-scan / threat-model / oia-audit)
 import { metaharnessTools } from './mcp-tools/metaharness-tools.js';
@@ -63,12 +68,17 @@ import { agenticowSpeculateTools } from './mcp-tools/agenticow-speculate-tools.j
 // ADR-164 — AgentBBS federated business-domain BBS rooms (Phase 1).
 // Optional runtime dep, every handler returns `{degraded: true}` when missing.
 import { agentbbsTools } from './mcp-tools/agentbbs-tools.js';
+import { xFederationTools } from './mcp-tools/x-federation-tools.js';
+import { seraphinaTools } from './mcp-tools/seraphina-tools.js';
+import { xFederationJoinTools } from './mcp-tools/x-federation-join.js';
+import { xFederationChannelTools } from './mcp-tools/x-federation-channels.js';
 // ADR-164 Phase 2 — Business-pod template validation (pure local, no optional deps).
 import { businessPodTools } from './mcp-tools/business-pod-tools.js';
 // ADR-164 Phase 4 §5.1.8 — http_fetch MCP tool (secure-by-default HTTP probe
 // for ops-pod synthetic-endpoint benches). Default-rejects private addresses
 // + auth headers; opt-in via CLAUDE_FLOW_HTTP_FETCH_ALLOW_PRIVATE / _AUTH=1.
 import { httpFetchTools } from './mcp-tools/http-fetch-tools.js';
+import { missionTools } from './mcp-tools/mission-tools.js';
 // #1916: coverage-aware routing tools — defined in ruvector/coverage-tools.ts
 // but were never registered, so the `ruflo hooks coverage-*` CLI subcommands
 // failed with `Tool not found: hooks_coverage-route`.
@@ -135,6 +145,10 @@ registerTools([
   ...progressTools,
   ...embeddingsTools,
   ...claimsTools,
+  // Remote MCP exposes evaluation/status only. Administrative mutation is a
+  // local CLI bootstrap/recovery operation until the server has authenticated
+  // human identity propagation.
+  ...policyTools.filter((tool) => ['policy_evaluate', 'policy_status'].includes(tool.name)),
   ...securityTools,
   ...transferTools,
   // V2 Compatibility tools
@@ -169,12 +183,28 @@ registerTools([
   ...agenticowSpeculateTools,
   // ADR-164 — AgentBBS federated business-domain BBS rooms (4 tools, Phase 1, graceful-degraded)
   ...agentbbsTools,
+  ...xFederationTools,
+  ...seraphinaTools,
+  ...xFederationJoinTools,
+  ...xFederationChannelTools,
   // ADR-164 Phase 2 + Phase 3 — business_pod_validate + business_pod_route_backend
   // (2 tools, no optional dep — schema validator + §3.4 domain-affinity router)
   ...businessPodTools,
   // ADR-164 Phase 4 §5.1.8 — http_fetch (1 tool, secure-by-default HTTP probe)
   ...httpFetchTools,
+  // ADR-406 — mission semantic operations (create/plan/get/events/request_action)
+  ...missionTools,
 ]);
+
+// The capability brain consumes the completed live registry. This is injected
+// after registration to keep guidance honest and avoid a registry import cycle.
+configureGuidanceToolProvider(() => Array.from(TOOL_REGISTRY.values()).map((tool) => ({
+  name: tool.name,
+  description: tool.description,
+  category: tool.category,
+  tags: tool.tags,
+  version: tool.version,
+})));
 
 /**
  * MCP Client Error
@@ -230,6 +260,15 @@ export async function callMCPTool<T = unknown>(
   }
 
   try {
+    // ADR-324: one policy chokepoint for every local CLI/MCP invocation.
+    // Policy administration is not exempt: authorization calls the engine
+    // directly, so there is no recursive MCP dispatch. In enforce mode an
+    // administrator must explicitly allow policy.* actions or use the local
+    // CLI bootstrap path.
+    const decision = await authorizeMcpTool(toolName, input, context, classifyMcpTool(toolName));
+    if (decision.enforcedOutcome !== 'allowed') {
+      throw new Error(`policy-${decision.enforcedOutcome}:${decision.reason}; receipt=${decision.receiptId}`);
+    }
     // Call the tool handler
     const result = await tool.handler(input, context);
     // ADR-146 P2: scan every tool result for indirect-injection before it

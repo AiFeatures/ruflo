@@ -4,6 +4,7 @@ import { cp, mkdir, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stageInternalRuntimeBundles } from '../../../../scripts/stage-internal-runtime-bundles.mjs';
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repoRoot = resolve(packageDir, '..', '..', '..');
@@ -27,6 +28,8 @@ for (const buildDir of [resolve(packageDir, '..', 'swarm'), packageDir]) {
   }
 }
 
+await stageInternalRuntimeBundles(packageDir);
+
 await cp(join(repoRoot, 'README.md'), join(packageDir, 'README.md'));
 await rm(pluginsDir, { recursive: true, force: true });
 await mkdir(pluginsDir, { recursive: true });
@@ -35,6 +38,21 @@ await cp(
   join(pluginsDir, 'ruflo-metaharness'),
   { recursive: true },
 );
+
+// ADR-489: `ruflo tui` loads one bundled file from the CLI's own install
+// (plugins/ruflo-console/dist/tui.mjs, see src/commands/tui.ts). Build it from
+// the plugin's source with the repo's esbuild and stage only that file, so the
+// registry install runs the console and the tarball carries no console source.
+const tuiBundle = join(pluginsDir, 'ruflo-console', 'dist', 'tui.mjs');
+const tuiBuild = spawnSync(
+  process.execPath,
+  [join(repoRoot, 'plugins', 'ruflo-console', 'scripts', 'build-tui.mjs'), '--outfile', tuiBundle],
+  { cwd: repoRoot, stdio: 'inherit' },
+);
+if (tuiBuild.error) throw tuiBuild.error;
+if (tuiBuild.status !== 0) {
+  throw new Error(`build-tui.mjs failed with exit code ${tuiBuild.status ?? 'unknown'}`);
+}
 
 for (const script of [
   'generate-catalog-manifest.mjs',
