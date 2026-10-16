@@ -387,7 +387,7 @@ export const DEFAULT_INIT_OPTIONS: InitOptions = {
     github: true,
     flowNexus: false,
     browser: true,
-    v3: true,
+    v3: false,        // ADR-128: opt-in like agents.v3; use --full or `init skills --v3`
     dualMode: false,  // Optional: enable with --dual flag
     all: false,
   },
@@ -605,4 +605,11 @@ export interface InitResult {
     agentsCount: number;
     hooksEnabled: number;
   };
+  /**
+   * Advisory-only findings from settings-risk-scanner.ts: dangerous-looking
+   * hook commands or Bash allow-rules found in a *pre-existing*
+   * settings.json this init carried forward unexamined. Never blocks
+   * init — surfaced so a user can review before trusting it.
+   */
+  warnings?: string[];
 }
